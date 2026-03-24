@@ -1,5 +1,6 @@
 import type { Context } from '../context';
 import type { NormalizedMessage } from '../message';
+import { PluginHookType } from '../plugin';
 import { Project } from '../project';
 import { Session } from '../session';
 import type { Tool } from '../tool';
@@ -106,6 +107,7 @@ export async function executeAgent(
     // Create Project instance with agent log path
     const project = new Project({
       sessionId: `agent-${agentId}`,
+      parentSessionId: options.parentSessionId,
       context,
     });
 
@@ -115,6 +117,7 @@ export async function executeAgent(
       systemPrompt: definition.systemPrompt,
       tools: filteredToolList,
       signal,
+      skipStopHook: true,
       onMessage: async ({ message }) => {
         // Add agent metadata
         const enhancedMessage: NormalizedMessage = {
@@ -138,8 +141,9 @@ export async function executeAgent(
     });
 
     // Handle result
+    let executionResult: AgentExecutionResult;
     if (result.success) {
-      return {
+      executionResult = {
         status: AgentStatus.Completed,
         agentId,
         content: extractFinalContent(result.data),
@@ -151,16 +155,36 @@ export async function executeAgent(
           outputTokens: result.data.usage?.completionTokens || 0,
         },
       };
+    } else {
+      executionResult = {
+        status: AgentStatus.Failed,
+        agentId,
+        content: `Agent execution failed: ${result.error.message}`,
+        totalToolCalls: 0,
+        totalDuration: Date.now() - startTime,
+        model: modelName,
+        usage: { inputTokens: 0, outputTokens: 0 },
+      };
     }
-    return {
-      status: AgentStatus.Failed,
-      agentId,
-      content: `Agent execution failed: ${result.error.message}`,
-      totalToolCalls: 0,
-      totalDuration: Date.now() - startTime,
-      model: modelName,
-      usage: { inputTokens: 0, outputTokens: 0 },
-    };
+
+    await context.apply({
+      hook: 'subagentStop',
+      args: [
+        {
+          parentSessionId: options.parentSessionId || '',
+          agentId,
+          agentType: definition.agentType,
+          result: executionResult,
+          usage: executionResult.usage,
+          totalToolCalls: executionResult.totalToolCalls,
+          totalDuration: executionResult.totalDuration,
+          model: modelName,
+        },
+      ],
+      type: PluginHookType.Series,
+    });
+
+    return executionResult;
   } catch (error) {
     return {
       status: AgentStatus.Failed,

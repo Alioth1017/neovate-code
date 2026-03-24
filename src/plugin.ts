@@ -1,13 +1,23 @@
 import type { AnthropicProvider } from '@ai-sdk/anthropic';
 import type { OpenAIProvider } from '@ai-sdk/openai';
 import type { OpenAICompatibleProvider } from '@ai-sdk/openai-compatible';
-import type { LanguageModelV2 } from '@openrouter/ai-sdk-provider';
+import type { LanguageModelV3 } from '@ai-sdk/provider';
 import defu from 'defu';
-import type { PluginAgentDefinition } from './agent/types';
+import type {
+  AgentExecutionResult,
+  PluginAgentDefinitionOrPath,
+} from './agent/types';
 import type { Config } from './config';
 import type { Context, ContextCreateOpts } from './context';
 import type { LoopResult } from './loop';
-import type { ModelAlias, ModelMap, Provider, ProvidersMap } from './model';
+import type {
+  ModelAlias,
+  ModelMap,
+  Provider,
+  ProvidersMap,
+} from './provider/model';
+import type { NodeBridgeHandlers } from './nodeBridge.types';
+import type { ScopedSkillPath } from './pluginRegistry/scopedTypes';
 import type { OutputStyle } from './outputStyle';
 import type { SlashCommand } from './slash-commands/types';
 import type { Tool, ToolResult, ToolUse } from './tool';
@@ -144,7 +154,9 @@ export type Plugin = {
   slashCommand?: (
     this: PluginContext,
   ) => Promise<SlashCommand[]> | SlashCommand[];
-  skill?: (this: PluginContext) => Promise<string[]> | string[];
+  skill?: (
+    this: PluginContext,
+  ) => Promise<(string | ScopedSkillPath)[]> | (string | ScopedSkillPath)[];
   outputStyle?: (this: PluginContext) => Promise<OutputStyle[]> | OutputStyle[];
   provider?: (
     this: PluginContext,
@@ -154,7 +166,7 @@ export type Plugin = {
       defaultModelCreator: (
         name: string,
         provider: Provider,
-      ) => LanguageModelV2;
+      ) => LanguageModelV3;
       createOpenAI: (options: any) => OpenAIProvider;
       createOpenAICompatible: (options: any) => OpenAICompatibleProvider;
       createAnthropic: (options: any) => AnthropicProvider;
@@ -247,7 +259,7 @@ export type Plugin = {
   // agent
   agent?: (
     this: PluginContext,
-  ) => Promise<PluginAgentDefinition[]> | PluginAgentDefinition[];
+  ) => Promise<PluginAgentDefinitionOrPath[]> | PluginAgentDefinitionOrPath[];
 
   // Telemetry hook for collecting usage analytics
   telemetry?: (
@@ -257,4 +269,35 @@ export type Plugin = {
       payload: Record<string, any>;
     },
   ) => Promise<void> | void;
+
+  stop?: (
+    this: PluginContext,
+    opts: {
+      sessionId: string;
+      result: LoopResult;
+      usage: Usage;
+      turnsCount: number;
+      toolCallsCount: number;
+      duration: number;
+      model: string;
+    },
+  ) => Promise<void> | void;
+
+  subagentStop?: (
+    this: PluginContext,
+    opts: {
+      parentSessionId: string;
+      agentId: string;
+      agentType: string;
+      result: AgentExecutionResult;
+      usage: { inputTokens: number; outputTokens: number };
+      totalToolCalls: number;
+      totalDuration: number;
+      model: string;
+    },
+  ) => Promise<void> | void;
+
+  nodeBridgeHandler?: (
+    this: PluginContext,
+  ) => Promise<NodeBridgeHandlers> | NodeBridgeHandlers;
 };

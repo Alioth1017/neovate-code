@@ -1,6 +1,8 @@
 import { Box, Text } from 'ink';
 import type { ToolResultPart, ToolResultPart2 } from '../../message';
+import { useAppStore } from '../store';
 import type { LogItem } from './utils';
+import { truncateLine } from './utils';
 
 // Helper to extract text from ToolResult
 function extractResultText(
@@ -46,6 +48,7 @@ function extractResultText(
 function formatToolArgs(
   toolName: string,
   args: Record<string, unknown>,
+  transcriptMode: boolean,
 ): string {
   if (toolName === 'todoWrite') {
     const todos = args.todos as Array<{ content: string; status: string }>;
@@ -55,9 +58,9 @@ function formatToolArgs(
       const pending = todos.filter((t) => t.status === 'pending').length;
       if (inProgressTodo) {
         const taskName =
-          inProgressTodo.content.length > 40
-            ? `${inProgressTodo.content.substring(0, 40)}...`
-            : inProgressTodo.content;
+          transcriptMode || inProgressTodo.content.length <= 40
+            ? inProgressTodo.content
+            : `${inProgressTodo.content.substring(0, 40)}...`;
         return `"${taskName}" [${completed}/${todos.length}]`;
       }
       return `${todos.length} todos: ${completed} done, ${pending} pending`;
@@ -67,10 +70,16 @@ function formatToolArgs(
   if (toolName === 'bash') {
     const cmd = args.command as string;
     if (cmd) {
+      if (transcriptMode) {
+        return cmd;
+      }
       const firstLine = cmd.split('\n')[0];
       const truncated =
         firstLine.length > 60 ? `${firstLine.substring(0, 60)}...` : firstLine;
-      return cmd.includes('\n') ? `${truncated}` : truncated;
+      const result = cmd.includes('\n') ? `${truncated}` : truncated;
+
+      // Final length protection to ensure max 200 characters
+      return result.length > 200 ? `${result.substring(0, 200)}...` : result;
     }
   }
 
@@ -82,10 +91,10 @@ function formatToolArgs(
         return '';
       }
       const str = JSON.stringify(v);
-      if (str.length > 80) {
-        return `${str.substring(0, 80)}...`;
+      if (transcriptMode || str.length <= 80) {
+        return str;
       }
-      return str;
+      return `${str.substring(0, 80)}...`;
     })
     .join(', ');
 }
@@ -95,12 +104,17 @@ interface LogItemRendererProps {
 }
 
 export function LogItemRenderer({ item }: LogItemRendererProps) {
+  const { transcriptMode } = useAppStore();
+
   // User message
   if (item.type === 'user') {
+    const displayContent = transcriptMode
+      ? item.content
+      : truncateLine(item.content);
     return (
       <Box paddingLeft={1}>
         <Text color="gray">
-          {'>'} {item.content}
+          {'>'} {displayContent}
         </Text>
       </Box>
     );
@@ -109,23 +123,25 @@ export function LogItemRenderer({ item }: LogItemRendererProps) {
   // Tool interaction
   if (item.type === 'tool') {
     const { toolUse, toolResult } = item;
-    // Use the new formatter for arguments
-    const args =
-      toolUse.description || formatToolArgs(toolUse.name, toolUse.input);
+    // Use description if available, otherwise format args
+    // When in transcriptMode, always use full description or format with no truncation
+    const args = transcriptMode
+      ? toolUse.description || formatToolArgs(toolUse.name, toolUse.input, true)
+      : toolUse.description ||
+        formatToolArgs(toolUse.name, toolUse.input, false);
+
+    let displayArgs = args;
+    if (!transcriptMode) {
+      displayArgs = truncateLine(args, 200);
+    }
+
     const resultText = toolResult
       ? extractResultText(toolResult).trim()
       : '...';
 
-    // Split result into lines to handle multiline output gracefully
-    const resultLines = resultText.split('\n');
-    const firstLine = resultLines[0];
-    const hasMore = resultLines.length > 1;
-
-    // Truncate first line if too long
-    const displayResult =
-      firstLine.length > 200
-        ? `${firstLine.substring(0, 200)}...`
-        : firstLine + (hasMore ? '...' : '');
+    const displayResult = transcriptMode
+      ? resultText
+      : truncateLine(resultText, 200);
 
     const isError = toolResult?.result?.isError;
 
@@ -135,7 +151,7 @@ export function LogItemRenderer({ item }: LogItemRendererProps) {
           <Text color="cyan" bold>
             {toolUse.name}
           </Text>
-          <Text color="gray">({args})</Text>
+          <Text color="gray">({displayArgs})</Text>
         </Box>
         {toolResult && (
           <Box paddingLeft={2}>
@@ -151,9 +167,13 @@ export function LogItemRenderer({ item }: LogItemRendererProps) {
     const trimmedContent = item.content.trim();
     if (!trimmedContent) return null;
 
+    const displayContent = transcriptMode
+      ? trimmedContent
+      : truncateLine(trimmedContent, 200);
+
     return (
       <Box paddingLeft={1}>
-        <Text color="gray"> {trimmedContent}</Text>
+        <Text color="gray"> {displayContent}</Text>
       </Box>
     );
   }

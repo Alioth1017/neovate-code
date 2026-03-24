@@ -4,51 +4,29 @@ import { WebServer } from './web-server';
 const DEFAULT_PORT = 1024;
 const DEFAULT_HOST = '127.0.0.1';
 
-export async function runServer(opts: { cwd: string; contextCreateOpts: any }) {
-  const { default: yargsParser } = await import('yargs-parser');
-  const argv = yargsParser(process.argv.slice(2), {
-    alias: {
-      port: 'p',
-      host: 'h',
-    },
-    number: ['port'],
-    string: ['host'],
-  });
-
+export async function runServer(opts: {
+  cwd: string;
+  contextCreateOpts: any;
+  port?: number;
+  host?: string;
+}): Promise<() => Promise<void>> {
   const port = await portfinder.getPortPromise({
-    port: Number.parseInt(String(argv.port || DEFAULT_PORT), 10),
+    port: opts.port ?? DEFAULT_PORT,
   });
 
   const server = new WebServer({
     port,
-    host: argv.host || DEFAULT_HOST,
+    host: opts.host ?? DEFAULT_HOST,
     contextCreateOpts: opts.contextCreateOpts,
     cwd: opts.cwd,
   });
 
-  let isShuttingDown = false;
-
   const shutdown = async () => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-
     console.log('\n[WebServer] Shutting down...');
-    try {
-      await server.stop();
-      process.exit(0);
-    } catch (error) {
-      console.error('[WebServer] Error during shutdown:', error);
-      process.exit(1);
-    }
+    await server.stop();
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  await server.start();
 
-  try {
-    await server.start();
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
+  return shutdown;
 }

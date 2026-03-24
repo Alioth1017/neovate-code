@@ -1,6 +1,5 @@
 import { Box, Text, useInput } from 'ink';
-import SelectInput from 'ink-select-input';
-import React, { useCallback } from 'react';
+import React, { useEffect } from 'react';
 import { clearTerminal } from '../utils/terminal';
 import { ActivityIndicator } from './ActivityIndicator';
 import { ApprovalModal } from './ApprovalModal';
@@ -9,12 +8,12 @@ import { ChatInput } from './ChatInput';
 import { Debug } from './Debug';
 import { ExitHint } from './ExitHint';
 import { ForkModal } from './ForkModal';
-import { Markdown } from './Markdown';
 import { Messages } from './Messages';
 import { QueueDisplay } from './QueueDisplay';
 import { useAppStore } from './store';
 import { TerminalSizeProvider } from './TerminalSizeContext';
 import { TranscriptModeIndicator } from './TranscriptModeIndicator';
+import { useNotification } from './useNotification';
 import { useTerminalRefresh } from './useTerminalRefresh';
 
 function SlashCommandJSX() {
@@ -22,71 +21,40 @@ function SlashCommandJSX() {
   return <Box>{slashCommandJSX}</Box>;
 }
 
-function PlanResult() {
-  const { planResult, approvePlan, denyPlan } = useAppStore();
-  const onSelect = useCallback(
-    (approved: boolean) => {
-      if (approved) {
-        approvePlan(planResult ?? '');
-      } else {
-        denyPlan();
-      }
-    },
-    [planResult, approvePlan, denyPlan],
-  );
-  if (!planResult) return null;
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor="gray"
-      padding={1}
-    >
-      <Text bold>Here is the plan:</Text>
-      <Box
-        flexDirection="column"
-        borderStyle="round"
-        borderColor="gray"
-        padding={1}
-      >
-        <Markdown>{planResult ?? ''}</Markdown>
-      </Box>
-      <Box marginY={1}>
-        <Text bold>Do you want to proceed?</Text>
-      </Box>
-      <SelectInput
-        items={[
-          {
-            label: 'Yes',
-            value: true,
-          },
-          {
-            label: 'No, I want to edit the plan',
-            value: false,
-          },
-        ]}
-        onSelect={(item: any) => onSelect(item.value)}
-      />
-    </Box>
-  );
-}
-
 export function App() {
   const { forceRerender } = useTerminalRefresh();
+  useNotification();
+
+  useEffect(() => {
+    if (!process.stdin.isTTY) return;
+    process.stdout.write('\x1b[?1004h');
+    return () => {
+      process.stdout.write('\x1b[?1004l');
+    };
+  }, []);
+
+  useInput(
+    (input) => {
+      if (input === '[I' || input === '[O') {
+        useAppStore.getState().setWindowFocused(input === '[I');
+      }
+    },
+    { isActive: true },
+  );
+
   const {
     forkModalVisible,
     fork,
     hideForkModal,
     forkParentUuid,
     forkCounter,
-    bridge,
-    sessionId,
-    cwd,
     transcriptMode,
     toggleTranscriptMode,
+    bridge,
+    cwd,
+    sessionId,
   } = useAppStore();
-  const [forkMessages, setForkMessages] = React.useState<any[]>([]);
-  const [forkLoading, setForkLoading] = React.useState(false);
+  const messages = useAppStore((s) => s.messages);
 
   useInput((input, key) => {
     // Ctrl+O: Toggle transcript mode
@@ -105,28 +73,6 @@ export function App() {
       return;
     }
   });
-
-  React.useEffect(() => {
-    if (!forkModalVisible) return;
-    if (!bridge || !cwd || !sessionId) {
-      setForkMessages([]);
-      return;
-    }
-    setForkLoading(true);
-    (async () => {
-      try {
-        const res = await bridge.request('session.messages.list', {
-          cwd,
-          sessionId,
-        });
-        setForkMessages(res.data?.messages || []);
-      } catch (_e) {
-        setForkMessages([]);
-      } finally {
-        setForkLoading(false);
-      }
-    })();
-  }, [forkModalVisible, bridge, cwd, sessionId]);
   return (
     <TerminalSizeProvider>
       <Box
@@ -135,24 +81,26 @@ export function App() {
       >
         <Messages />
         <BackgroundPrompt />
-        <PlanResult />
         <ActivityIndicator />
         <QueueDisplay />
         {transcriptMode ? <TranscriptModeIndicator /> : <ChatInput />}
-        {forkModalVisible && (
-          <ForkModal
-            messages={forkMessages as any}
-            onSelect={(uuid) => {
-              fork(uuid);
-            }}
-            onClose={() => {
-              hideForkModal();
-            }}
-          />
-        )}
         <ExitHint />
         <Debug />
       </Box>
+      {forkModalVisible && sessionId && (
+        <ForkModal
+          messages={messages as any}
+          onSelect={(uuid, restoreCode) => {
+            fork(uuid, restoreCode);
+          }}
+          onClose={() => {
+            hideForkModal();
+          }}
+          sessionId={sessionId}
+          cwd={cwd}
+          bridge={bridge}
+        />
+      )}
       <ApprovalModal />
       <SlashCommandJSX />
     </TerminalSizeProvider>

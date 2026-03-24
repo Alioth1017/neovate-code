@@ -3,6 +3,7 @@ import path from 'pathe';
 import type { NormalizedMessage } from './message';
 import { createUserMessage } from './message';
 import type { StreamResult } from './loop';
+import type { SerializedSnapshot } from './snapshot/types';
 
 export class JsonlLogger {
   filePath: string;
@@ -46,6 +47,22 @@ export class JsonlLogger {
       message,
     });
   }
+
+  /**
+   * Appends a snapshot entry to the JSONL log file.
+   * Snapshots are stored with type: 'snapshot' to distinguish from messages.
+   */
+  addSnapshot(snapshot: SerializedSnapshot): void {
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const entry = {
+      type: 'snapshot' as const,
+      ...snapshot,
+    };
+    fs.appendFileSync(this.filePath, JSON.stringify(entry) + '\n');
+  }
 }
 
 export class RequestLogger {
@@ -61,6 +78,44 @@ export class RequestLogger {
       fs.mkdirSync(requestsDir, { recursive: true });
     }
     return path.join(requestsDir, `${requestId}.jsonl`);
+  }
+
+  logRequest(opts: {
+    requestId: string;
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body?: unknown;
+  }) {
+    const filePath = this.getFilePath(opts.requestId);
+    const entry = {
+      type: 'request',
+      requestId: opts.requestId,
+      timestamp: new Date().toISOString(),
+      url: opts.url,
+      method: opts.method,
+      headers: opts.headers,
+      body: opts.body,
+    };
+    fs.appendFileSync(filePath, JSON.stringify(entry) + '\n');
+  }
+
+  logResponse(opts: {
+    requestId: string;
+    url: string;
+    status: number;
+    headers: Record<string, string>;
+  }) {
+    const filePath = this.getFilePath(opts.requestId);
+    const entry = {
+      type: 'response',
+      requestId: opts.requestId,
+      timestamp: new Date().toISOString(),
+      url: opts.url,
+      status: opts.status,
+      headers: opts.headers,
+    };
+    fs.appendFileSync(filePath, JSON.stringify(entry) + '\n');
   }
 
   logMetadata(opts: {

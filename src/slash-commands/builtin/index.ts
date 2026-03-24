@@ -1,3 +1,4 @@
+import { createBranchCommand } from './branch';
 import type { SlashCommand } from '../types';
 import { createAddDirCommand } from './add-dir';
 import { createBugCommand } from './bug';
@@ -12,12 +13,17 @@ import { createLogoutCommand } from './logout';
 import { createMcpCommand } from './mcp';
 import { createModelCommand } from './model';
 import { createOutputStyleCommand } from './output-style';
+import { createPluginCommand } from './plugin';
+import { skillsCommand } from './skills';
+import { createRenameCommand } from './rename';
 import { createResumeCommand } from './resume';
 import { createReviewCommand } from './review';
+import { createRewindCommand } from './rewind';
 import { brainstormCommand } from './spec/brainstorm';
 import { executePlanCommand } from './spec/execute-plan';
 import { saveDesignCommand } from './spec/save-design';
 import { writePlanCommand } from './spec/write-plan';
+import { copyCommand } from './copy';
 import { exportCommand } from './export';
 import { statusCommand } from './status';
 import { createTerminalSetupCommand } from './terminal-setup';
@@ -29,6 +35,7 @@ export function createBuiltinCommands(opts: {
   askUserQuestion?: boolean;
 }): SlashCommand[] {
   return [
+    createBranchCommand(),
     clearCommand,
     contextCommand,
     exitCommand,
@@ -39,17 +46,22 @@ export function createBuiltinCommands(opts: {
     createMcpCommand(opts),
     createModelCommand(opts),
     createOutputStyleCommand(),
+    createRenameCommand(),
     createResumeCommand(),
     createReviewCommand(opts.language),
+    createRewindCommand(),
     createTerminalSetupCommand(),
     createBugCommand(),
     compactCommand,
     statusCommand,
     exportCommand,
+    copyCommand,
     createAddDirCommand(),
     brainstormCommand(opts.language, opts.askUserQuestion),
     writePlanCommand(opts.language),
     executePlanCommand(opts.language),
     saveDesignCommand(opts.language),
+    createPluginCommand(),
+    skillsCommand,
   ];
 }

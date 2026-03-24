@@ -12,6 +12,8 @@ describe('resolveTools with tools config', () => {
       productName: 'test',
       paths: {
         globalConfigDir: '/test/.neovate',
+        getSessionLogPath: (sessionId: string) =>
+          `/test/.neovate/projects/test/${sessionId}.jsonl`,
       },
       config: {
         model: 'test-model',
@@ -37,7 +39,12 @@ describe('resolveTools with tools config', () => {
       skillManager: {
         getSkills: vi.fn().mockResolvedValue([]),
       },
-      apply: vi.fn().mockResolvedValue({}),
+      apply: vi.fn().mockImplementation((opts) => {
+        if (opts.hook === 'tool') {
+          return Promise.resolve(opts.memo);
+        }
+        return Promise.resolve({});
+      }),
     } as any;
   };
 

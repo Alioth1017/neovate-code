@@ -1,10 +1,23 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useDebounce } from './hooks/useDebounce';
 import { sortFilePaths } from './sortFilePaths';
 import { useAppStore } from './store';
 import { useListNavigation } from './useListNavigation';
 import type { InputState } from './useInputState';
+import { useAgentSuggestion, type AgentInfo } from './useAgentSuggestion';
 
 type TriggerType = 'at' | 'tab';
+
+export type SuggestionItemType = 'file' | 'agent';
+
+export interface SuggestionItem {
+  type: SuggestionItemType;
+  displayText: string;
+  description?: string;
+  path?: string;
+  agentType?: string;
+  color?: string;
+}
 
 interface MatchResult {
   hasQuery: boolean;
@@ -18,56 +31,47 @@ export function usePaths(query: string, hasQuery: boolean) {
   const { bridge, cwd } = useAppStore();
   const [isLoading, setIsLoading] = useState(false);
   const [paths, setPaths] = useState<string[]>([]);
-  const [lastLoadTime, setLastLoadTime] = useState(0);
-  const prevQueryRef = useRef('');
+  const requestIdRef = useRef(0);
+  const lastQueryRef = useRef(query);
 
-  const loadPaths = useCallback(
-    (forceReload = false) => {
-      if (isLoading) {
-        return;
-      }
-
-      const CACHE_TIME = 60000;
-      if (!forceReload && Date.now() - lastLoadTime < CACHE_TIME) {
-        return;
-      }
-
-      setIsLoading(true);
-      bridge
-        .request('utils.getPaths', { cwd })
-        .then((res) => {
-          setPaths(res.data.paths);
-          setIsLoading(false);
-          setLastLoadTime(Date.now());
-        })
-        .catch((error) => {
-          console.error('Failed to get paths:', error);
-          setIsLoading(false);
-        });
-    },
-    [bridge, cwd, lastLoadTime, isLoading],
-  );
+  const debouncedQuery = useDebounce(query, 150);
 
   useEffect(() => {
-    if (prevQueryRef.current !== '' && query === '' && hasQuery) {
-      loadPaths(true);
+    if (query !== lastQueryRef.current) {
+      lastQueryRef.current = query;
+      setPaths([]);
     }
-    prevQueryRef.current = query;
-  }, [query, hasQuery, loadPaths]);
+  }, [query]);
 
   useEffect(() => {
-    if (
-      hasQuery &&
-      (paths.length === 0 || Date.now() - lastLoadTime >= 60000)
-    ) {
-      loadPaths(false);
+    if (!hasQuery) {
+      setPaths([]);
+      return;
     }
-  }, [hasQuery, paths.length, lastLoadTime, loadPaths]);
+
+    const currentRequestId = ++requestIdRef.current;
+    setIsLoading(true);
+    bridge
+      .request('utils.searchPaths', {
+        cwd,
+        query: debouncedQuery,
+        maxResults: 100,
+      })
+      .then((res) => {
+        if (currentRequestId !== requestIdRef.current) return;
+        setPaths(res.data.paths);
+        setIsLoading(false);
+      })
+      .catch((error) => {
+        if (currentRequestId !== requestIdRef.current) return;
+        console.error('Failed to search paths:', error);
+        setIsLoading(false);
+      });
+  }, [bridge, cwd, debouncedQuery, hasQuery]);
 
   return {
     paths,
     isLoading,
-    loadPaths,
   };
 }
 
@@ -241,45 +245,72 @@ export function useFileSuggestion(
   const activeMatch = atMatch.hasQuery ? atMatch : tabMatch;
   const { hasQuery, fullMatch, query, startIndex, triggerType } = activeMatch;
 
-  const queryForPaths = triggerType === 'at' ? query : '';
-  const { paths, isLoading, loadPaths } = usePaths(queryForPaths, hasQuery);
+  const { paths, isLoading: isLoadingPaths } = usePaths(query, hasQuery);
+  const { agents, isLoading: isLoadingAgents } = useAgentSuggestion(
+    query,
+    hasQuery && triggerType === 'at',
+  );
 
-  const matchedPaths = useMemo(() => {
+  const suggestions = useMemo((): SuggestionItem[] => {
     if (!hasQuery) return [];
-    const filtered =
-      query === ''
-        ? paths
-        : paths.filter((path) =>
-            path.toLowerCase().includes(query.toLowerCase()),
-          );
-    return sortFilePaths(filtered, query);
-  }, [paths, hasQuery, query]);
 
-  // Use common list navigation logic
-  const navigation = useListNavigation(matchedPaths);
+    const fileSuggestions: SuggestionItem[] = sortFilePaths(paths, query).map(
+      (path) => ({
+        type: 'file' as const,
+        displayText: path,
+        path,
+      }),
+    );
 
-  // Track matchedPaths length to reset selection when it changes
-  const prevMatchedPathsLengthRef = useRef(matchedPaths.length);
+    if (triggerType !== 'at') {
+      return fileSuggestions;
+    }
+
+    const agentSuggestions: SuggestionItem[] = agents.map((agent) => ({
+      type: 'agent' as const,
+      displayText: `agent-${agent.agentType}`,
+      description: `Agent: ${agent.description}`,
+      agentType: agent.agentType,
+      color: agent.color,
+    }));
+
+    return [...agentSuggestions, ...fileSuggestions].slice(0, 15);
+  }, [paths, agents, hasQuery, query, triggerType]);
+
+  const navigation = useListNavigation(suggestions);
+
+  const prevSuggestionsLengthRef = useRef(suggestions.length);
   useEffect(() => {
-    if (prevMatchedPathsLengthRef.current !== matchedPaths.length) {
+    if (prevSuggestionsLengthRef.current !== suggestions.length) {
       navigation.reset();
-      prevMatchedPathsLengthRef.current = matchedPaths.length;
+      prevSuggestionsLengthRef.current = suggestions.length;
     }
   });
 
-  const getSelected = () => {
+  const getSelected = (): SuggestionItem | null => {
+    return navigation.getSelected();
+  };
+
+  const getSelectedText = (): string => {
     const selected = navigation.getSelected();
     if (!selected) return '';
-    // Wrap in quotes if the path contains spaces
-    if (selected.includes(' ')) {
-      return `"${selected}"`;
+
+    if (selected.type === 'agent') {
+      return `agent-${selected.agentType}`;
     }
-    return selected;
+
+    if (selected.path && selected.path.includes(' ')) {
+      return `"${selected.path}"`;
+    }
+    return selected.path ?? '';
   };
 
   return {
-    matchedPaths,
-    isLoading,
+    suggestions,
+    matchedPaths: suggestions
+      .filter((s) => s.type === 'file')
+      .map((s) => s.path!),
+    isLoading: isLoadingPaths || isLoadingAgents,
     selectedIndex: navigation.selectedIndex,
     startIndex,
     fullMatch,
@@ -287,5 +318,6 @@ export function useFileSuggestion(
     navigateNext: navigation.navigateNext,
     navigatePrevious: navigation.navigatePrevious,
     getSelected,
+    getSelectedText,
   };
 }

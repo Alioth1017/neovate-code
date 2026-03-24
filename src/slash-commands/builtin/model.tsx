@@ -1,7 +1,6 @@
 import { Box, Text, useInput } from 'ink';
 import pc from 'picocolors';
 import React, { useEffect, useState } from 'react';
-import type { ModelInfo } from '../../model';
 import PaginatedGroupSelectInput from '../../ui/PaginatedGroupSelectInput';
 import { useAppStore } from '../../ui/store';
 import type { LocalJSXCommand } from '../types';
@@ -14,7 +13,13 @@ interface ModelSelectProps {
 interface GroupedData {
   provider: string;
   providerId: string;
+  isActive?: boolean;
   models: { name: string; modelId: string; value: string }[];
+}
+
+interface NullModel {
+  providerId: string;
+  modelId: string;
 }
 
 export const ModelSelect: React.FC<ModelSelectProps> = ({
@@ -29,17 +34,68 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
     modelId: string;
   } | null>(null);
   const [groupedModels, setGroupedModels] = useState<GroupedData[]>([]);
+  const [nullModels, setNullModels] = useState<NullModel[]>([]);
+  const [recentModels, setRecentModels] = useState<string[]>([]);
+  const [recentModelsLimit, setRecentModelsLimit] = useState<number>(10);
 
   useEffect(() => {
-    bridge.request('models.list', { cwd }).then((result) => {
-      if (result.data.currentModel) {
-        const currentModel: ModelInfo = result.data.currentModel;
-        setCurrentModel(`${currentModel.provider.id}/${currentModel.model.id}`);
-        setCurrentModelInfo(result.data.currentModelInfo);
-      }
-      setGroupedModels(result.data.groupedModels);
-    });
+    bridge
+      .request('models.list', { cwd })
+      .then((result) => {
+        if (result.data?.currentModelInfo) {
+          setCurrentModelInfo(result.data.currentModelInfo);
+          setCurrentModel(
+            `${result.data.currentModelInfo.providerName}/${result.data.currentModelInfo.modelId}`,
+          );
+        }
+        setGroupedModels(result.data?.groupedModels || []);
+        setNullModels(result.data?.nullModels || []);
+        setRecentModels(result.data?.recentModels || []);
+        setRecentModelsLimit(result.data?.recentModelsLimit ?? 10);
+      })
+      .catch((error) => {
+        console.error('models.list failed:', error);
+      });
   }, [cwd]);
+
+  const allModelsMap = new Map<
+    string,
+    { name: string; modelId: string; value: string }
+  >();
+  const providerLookup = new Map<string, string>();
+  const activeGroupedModels = groupedModels.filter((g) => g.isActive !== false);
+  for (const group of activeGroupedModels) {
+    for (const model of group.models) {
+      allModelsMap.set(model.value, model);
+      providerLookup.set(model.value, group.provider);
+    }
+  }
+
+  const recentGroup: GroupedData | null =
+    recentModels.length > 0
+      ? {
+          provider: 'Recent',
+          providerId: 'recent',
+          models: recentModels
+            .filter((m) => allModelsMap.has(m))
+            .slice(0, recentModelsLimit)
+            .map((m) => {
+              const model = allModelsMap.get(m)!;
+              const providerName = providerLookup.get(m) || '';
+              return {
+                ...model,
+                name: providerName
+                  ? `${providerName} / ${model.name}`
+                  : model.name,
+              };
+            }),
+        }
+      : null;
+
+  const displayGroups =
+    recentGroup && recentGroup.models.length > 0
+      ? [recentGroup, ...activeGroupedModels]
+      : activeGroupedModels;
 
   return (
     <Box
@@ -52,6 +108,14 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
       <Box marginBottom={1}>
         <Text bold>Select Model</Text>
       </Box>
+      {nullModels.length > 0 && (
+        <Box marginBottom={1}>
+          <Text color="yellow">
+            Warning: Misconfigured models:{' '}
+            {nullModels.map((m) => `${m.providerId}/${m.modelId}`).join(', ')}
+          </Text>
+        </Box>
+      )}
       <Box marginBottom={1}>
         <Text color="gray">
           current model:{' '}
@@ -64,7 +128,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
       </Box>
       <Box>
         <PaginatedGroupSelectInput
-          groups={groupedModels}
+          groups={displayGroups}
           initialValue={currentModel}
           itemsPerPage={15}
           enableSearch={true}

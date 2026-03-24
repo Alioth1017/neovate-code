@@ -1,9 +1,11 @@
-import type { LanguageModelV2FunctionTool } from '@ai-sdk/provider';
+import type { LanguageModelV3FunctionTool } from '@ai-sdk/provider';
 import path from 'pathe';
 import * as z from 'zod';
 import type { Context } from './context';
 import type { ImagePart, TextPart } from './message';
-import { resolveModelWithContext } from './model';
+import { createPlanFileManager } from './planFile';
+import { resolveModelWithContext } from './provider/model';
+import { PluginHookType } from './plugin';
 import { createAskUserQuestionTool } from './tools/askUserQuestion';
 import {
   createBashOutputTool,
@@ -11,6 +13,7 @@ import {
   createKillBashTool,
 } from './tools/bash';
 import { createEditTool } from './tools/edit';
+import { createExitPlanModeTool } from './tools/exitPlanMode';
 import { createFetchTool } from './tools/fetch';
 import { createGlobTool } from './tools/glob';
 import { createGrepTool } from './tools/grep';
@@ -29,14 +32,17 @@ type ResolveToolsOpts = {
   askUserQuestion?: boolean;
   signal?: AbortSignal;
   task?: boolean;
+  isPlan?: boolean;
 };
 
 export async function resolveTools(opts: ResolveToolsOpts) {
   const { cwd, productName, paths } = opts.context;
   const sessionId = opts.sessionId;
-  // TODO: use small model for fetch tool
   const model = (
-    await resolveModelWithContext(opts.context.config.model, opts.context)
+    await resolveModelWithContext(
+      opts.context.config.smallModel || opts.context.config.model,
+      opts.context,
+    )
   ).model!;
   const hasSkills =
     opts.context.skillManager &&
@@ -46,7 +52,7 @@ export async function resolveTools(opts: ResolveToolsOpts) {
     createLSTool({ cwd }),
     createGlobTool({ cwd }),
     createGrepTool({ cwd }),
-    createFetchTool({ model }),
+    createFetchTool({ model, fetch: opts.context.fetch }),
     ...(hasSkills
       ? [createSkillTool({ skillManager: opts.context.skillManager! })]
       : []),
@@ -83,6 +89,21 @@ export async function resolveTools(opts: ResolveToolsOpts) {
       ]
     : [];
 
+  // Plan Mode tools (always registered)
+  const planFileManager = createPlanFileManager({
+    context: opts.context,
+    sessionId: opts.sessionId,
+  });
+
+  const planModeTools = [
+    createExitPlanModeTool({
+      context: opts.context,
+      sessionId: opts.sessionId,
+      messageBus: opts.context.messageBus,
+      planFileManager,
+    }),
+  ];
+
   const mcpTools = await getMcpTools(opts.context);
 
   const allTools = [
@@ -91,20 +112,31 @@ export async function resolveTools(opts: ResolveToolsOpts) {
     ...writeTools,
     ...todoTools,
     ...backgroundTools,
+    ...planModeTools, // Added directly, agents will filter via disallowedTools
     ...mcpTools,
   ];
 
-  const toolsConfig = opts.context.config.tools;
-  const availableTools = (() => {
-    if (!toolsConfig || Object.keys(toolsConfig).length === 0) {
-      return allTools;
-    }
-    return allTools.filter((tool) => {
-      // Check if the tool is disabled (only explicitly set to false will disable)
-      const isDisabled = toolsConfig[tool.name] === false;
-      return !isDisabled;
+  // 1. First, execute plugin hook to allow plugins to add/modify tools
+  let availableTools = allTools;
+  try {
+    availableTools = await opts.context.apply({
+      hook: 'tool',
+      args: [{ isPlan: opts.isPlan, sessionId: opts.sessionId }],
+      memo: allTools,
+      type: PluginHookType.SeriesMerge,
     });
-  })();
+  } catch (error) {
+    console.warn('[resolveTools] Plugin tool hook failed:', error);
+  }
+
+  // 2. Then, filter all tools (including plugin-injected ones) by config
+  const toolsConfig = opts.context.config.tools;
+  if (toolsConfig && Object.keys(toolsConfig).length > 0) {
+    availableTools = availableTools.filter((tool) => {
+      // Only explicitly set to false will disable the tool
+      return toolsConfig[tool.name] !== false;
+    });
+  }
 
   const taskTools = (() => {
     // Task tool is only available in quiet mode
@@ -188,7 +220,7 @@ export class Tools {
     return await tool.execute(argsObj, toolCallId);
   }
 
-  toLanguageV2Tools(): LanguageModelV2FunctionTool[] {
+  toLanguageV2Tools(): LanguageModelV3FunctionTool[] {
     return Object.entries(this.tools).map(([key, tool]) => {
       // parameters of mcp tools is not zod object
       const isMCP = key.startsWith('mcp__');
@@ -318,11 +350,20 @@ type AgentResultReturnDisplay = {
   status: 'completed' | 'failed';
 };
 
+type PlanModeExitReturnDisplay = {
+  type: 'plan_mode_exit';
+  planFilePath: string;
+  planContent: string | null;
+  isAgent: boolean;
+  scenario: 'approved_with_plan' | 'approved_without_plan' | 'agent_completed';
+};
+
 export type ReturnDisplay =
   | string
   | DiffViewerReturnDisplay
   | TodoWriteReturnDisplay
-  | AgentResultReturnDisplay;
+  | AgentResultReturnDisplay
+  | PlanModeExitReturnDisplay;
 
 export type ToolResult = {
   llmContent: string | (TextPart | ImagePart)[];
@@ -333,6 +374,9 @@ export type ToolResult = {
     agentType?: string;
     [key: string]: any;
   };
+  // Truncation related fields
+  truncated?: boolean; // Whether the output has been truncated
+  outputPath?: string; // Path to full output file (when truncated)
 };
 
 export function createTool<TSchema extends z.ZodTypeAny>(config: {

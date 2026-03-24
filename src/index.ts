@@ -1,7 +1,6 @@
 import assert from 'assert';
 import { render } from 'ink';
 import React from 'react';
-import { runTest } from './commands/__test';
 import { runServer } from './commands/server/server';
 import { Context } from './context';
 import { GlobalData } from './globalData';
@@ -23,13 +22,17 @@ import { UIBridge } from './uiBridge';
 import type { UpgradeOptions } from './upgrade';
 
 export { z as _zod } from 'zod';
+export type { ProviderConfig } from './config';
 export { ConfigManager as _ConfigManager } from './config';
 export { query as _query } from './query';
 // SDK exports for programmatic usage
 export {
+  createClient,
   createSession,
   prompt,
   resumeSession,
+  type SDKClient,
+  type SDKClientOptions,
   type SDKMessage,
   type SDKSession,
   type SDKSessionOptions,
@@ -43,7 +46,7 @@ export type { Plugin, Context };
 // https://github.com/yargs/yargs-parser/blob/6d69295/lib/index.ts#L19
 process.env.YARGS_MIN_NODE_VERSION = '18';
 
-type Argv = {
+export type Argv = {
   _: string[];
   // boolean
   help: boolean;
@@ -55,6 +58,7 @@ type Argv = {
   appendSystemPrompt?: string;
   approvalMode?: string;
   cwd?: string;
+  host?: string;
   language?: string;
   model?: string;
   outputFormat?: string;
@@ -65,12 +69,17 @@ type Argv = {
   resume?: string;
   systemPrompt?: string;
   tools?: string;
+  disableContextCache: boolean;
+  // number
+  port?: number;
   // array
   plugin: string[];
+  pluginDir: string[];
   mcpConfig: string[];
+  extensions: Record<string, any>;
 };
 
-async function parseArgs(argv: any) {
+export async function parseArgs(argv: any) {
   const { default: yargsParser } = await import('yargs-parser');
   const args = yargsParser(argv, {
     alias: {
@@ -85,12 +94,21 @@ async function parseArgs(argv: any) {
       mcp: true,
       mcpConfig: [],
     },
-    array: ['plugin', 'mcpConfig'],
-    boolean: ['help', 'mcp', 'quiet', 'continue', 'version'],
+    array: ['plugin', 'pluginDir', 'mcpConfig'],
+    boolean: [
+      'help',
+      'mcp',
+      'quiet',
+      'continue',
+      'version',
+      'disableContextCache',
+    ],
+    number: ['port'],
     string: [
       'appendSystemPrompt',
       'approvalMode',
       'cwd',
+      'host',
       'language',
       'mcpConfig',
       'model',
@@ -148,6 +166,8 @@ Examples:
   ${p} --tools '{"bash":false,"write":false}' "explain the logic"
 
 Commands:
+  acp                           Run as ACP (Agent Client Protocol) agent
+  call                          Call NodeBridge handlers directly
   config                        Manage configuration
   commit                        Commit changes to the repository
   log [file]                    View session logs in HTML (optional file path)
@@ -162,12 +182,6 @@ Commands:
 
 async function runQuiet(argv: Argv, contextCreateOpts: any, cwd: string) {
   try {
-    const exit = () => {
-      process.exit(0);
-    };
-    process.on('SIGINT', exit);
-    process.on('SIGTERM', exit);
-
     // Create MessageBus for event-driven architecture in quiet mode
     const nodeBridge = new NodeBridge({
       contextCreateOpts,
@@ -177,7 +191,7 @@ async function runQuiet(argv: Argv, contextCreateOpts: any, cwd: string) {
     messageBus.setTransport(quietTransport);
     nodeBridge.messageBus.setTransport(nodeTransport);
 
-    messageBus.registerHandler('toolApproval', async () => {
+    messageBus.registerHandler('toolApproval', async (_params) => {
       return { approved: true };
     });
 
@@ -244,7 +258,7 @@ async function runQuiet(argv: Argv, contextCreateOpts: any, cwd: string) {
       return Session.createSessionId();
     })();
 
-    await messageBus.request('session.initialize', {
+    const response = await messageBus.request('session.initialize', {
       cwd,
       sessionId,
     });
@@ -254,6 +268,9 @@ async function runQuiet(argv: Argv, contextCreateOpts: any, cwd: string) {
       cwd,
       sessionId,
       model,
+      thinking: response.data.thinkingLevel
+        ? { effort: response.data.thinkingLevel }
+        : undefined,
     });
 
     process.exit(0);
@@ -321,11 +338,6 @@ async function runInteractive(
     patchConsole: true,
     exitOnCtrlC: false,
   });
-  const exit = () => {
-    process.exit(0);
-  };
-  process.on('SIGINT', exit);
-  process.on('SIGTERM', exit);
 }
 
 export async function runNeovate(opts: {
@@ -334,8 +346,10 @@ export async function runNeovate(opts: {
   version: string;
   plugins: Plugin[];
   upgrade?: UpgradeOptions;
-}) {
-  const argv = await parseArgs(process.argv.slice(2));
+  argv: Argv;
+  fetch?: typeof globalThis.fetch;
+}): Promise<{ shutdown?: () => Promise<void> }> {
+  const argv = opts.argv;
   const cwd = argv.cwd || process.cwd();
 
   // Parse MCP config if provided
@@ -368,6 +382,8 @@ export async function runNeovate(opts: {
     productName: opts.productName,
     productASCIIArt: opts.productASCIIArt,
     version: opts.version,
+    fetch: opts.fetch,
+    noContextCache: argv.disableContextCache,
     argvConfig: {
       model: argv.model,
       planModel: argv.planModel,
@@ -376,6 +392,7 @@ export async function runNeovate(opts: {
       quiet: argv.quiet,
       outputFormat: argv.outputFormat,
       plugins: argv.plugin,
+      pluginDirs: argv.pluginDir,
       systemPrompt: argv.systemPrompt,
       appendSystemPrompt: argv.appendSystemPrompt,
       language: argv.language,
@@ -383,6 +400,7 @@ export async function runNeovate(opts: {
       approvalMode: argv.approvalMode,
       mcpServers,
       tools: toolsConfig,
+      extensions: argv.extensions,
     },
     plugins: opts.plugins,
   };
@@ -390,14 +408,31 @@ export async function runNeovate(opts: {
   // sub commands
   const command = argv._[0];
   if (command === 'server') {
-    await runServer({
+    const shutdown = await runServer({
+      cwd,
+      contextCreateOpts,
+      port: argv.port,
+      host: argv.host,
+    });
+    return { shutdown };
+  }
+  if (command === 'acp') {
+    const { runACP } = await import('./commands/acp');
+    await runACP({
       cwd,
       contextCreateOpts,
     });
-    return;
+    return {};
+  }
+  if (command === 'call') {
+    const { runCall } = await import('./commands/call');
+    await runCall({ cwd, contextCreateOpts });
+    return {};
   }
   const validCommands = [
     '__test',
+    'acp',
+    'call',
     'config',
     'commit',
     'mcp',
@@ -414,10 +449,6 @@ export async function runNeovate(opts: {
       ...contextCreateOpts,
     });
     switch (command) {
-      case '__test': {
-        await runTest(context);
-        break;
-      }
       case 'config': {
         const { runConfig } = await import('./commands/config');
         await runConfig(context);
@@ -462,16 +493,16 @@ export async function runNeovate(opts: {
       default:
         throw new Error(`Unsupported command: ${command}`);
     }
-    return;
+    return {};
   }
 
   if (argv.help) {
     printHelp(opts.productName.toLowerCase());
-    return;
+    return {};
   }
   if (argv.version) {
     console.log(opts.version);
-    return;
+    return {};
   }
 
   if (argv.quiet) {
@@ -494,4 +525,6 @@ export async function runNeovate(opts: {
     }
     await runInteractive(argv, contextCreateOpts, cwd, upgrade);
   }
+
+  return {};
 }

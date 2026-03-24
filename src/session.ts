@@ -1,10 +1,14 @@
 import fs from 'fs';
 import path from 'pathe';
+import createDebug from 'debug';
 import type { ApprovalMode } from './config';
 import { History } from './history';
 import type { NormalizedMessage } from './message';
 import { Usage } from './usage';
 import { randomUUID } from './utils/randomUUID';
+import type { SerializedSnapshot } from './snapshot/types';
+
+const debug = createDebug('neovate:session');
 
 export type SessionId = string;
 
@@ -52,6 +56,7 @@ export type SessionConfig = {
   pastedTextMap?: Record<string, string>;
   pastedImageMap?: Record<string, string>;
   additionalDirectories?: string[];
+  planSlug?: string;
 };
 
 const DEFAULT_SESSION_CONFIG: SessionConfig = {
@@ -72,7 +77,7 @@ export class SessionConfigManager {
 
   load(logPath: string): SessionConfig {
     if (!fs.existsSync(logPath)) {
-      return DEFAULT_SESSION_CONFIG;
+      return { ...DEFAULT_SESSION_CONFIG };
     }
     try {
       const content = fs.readFileSync(logPath, 'utf-8');
@@ -85,9 +90,9 @@ export class SessionConfigManager {
           }
         } catch {}
       }
-      return DEFAULT_SESSION_CONFIG;
+      return { ...DEFAULT_SESSION_CONFIG };
     } catch {
-      return DEFAULT_SESSION_CONFIG;
+      return { ...DEFAULT_SESSION_CONFIG };
     }
   }
   write() {
@@ -118,6 +123,48 @@ export class SessionConfigManager {
       );
     }
   }
+}
+
+/**
+ * Collect all tool_use IDs that have matching tool_result
+ * @param messages - Filtered message list
+ * @returns Set of tool_use IDs that have matching tool_result
+ */
+function getToolResultIds(messages: NormalizedMessage[]): Set<string> {
+  const ids = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role === 'tool' && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'tool-result') {
+          ids.add(part.toolCallId);
+        }
+      }
+    }
+  }
+
+  return ids;
+}
+
+/**
+ * Collect all tool_use IDs
+ * @param messages - Filtered message list
+ * @returns Set of all tool_use IDs
+ */
+function getToolUseIds(messages: NormalizedMessage[]): Set<string> {
+  const ids = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'tool_use') {
+          ids.add(part.id);
+        }
+      }
+    }
+  }
+
+  return ids;
 }
 
 export function filterMessages(
@@ -159,11 +206,48 @@ export function filterMessages(
   }
 
   // Filter original messages to only include those in the active path
-  return messageTypeOnly.filter((message) => activePath.has(message.uuid));
+  const filteredByPath = messageTypeOnly.filter((message) =>
+    activePath.has(message.uuid),
+  );
+
+  // === Clean up unmatched tool_use ===
+  const toolResultIds = getToolResultIds(filteredByPath);
+  const toolUseIds = getToolUseIds(filteredByPath);
+
+  // Calculate unmatched tool_use IDs (set difference)
+  const unmatchedIds = new Set(
+    [...toolUseIds].filter((id) => !toolResultIds.has(id)),
+  );
+
+  // Debug output
+  if (unmatchedIds.size > 0) {
+    debug(
+      `[filterMessages] Found ${unmatchedIds.size} unmatched tool_use(s): ${[...unmatchedIds].join(', ')}`,
+    );
+  }
+
+  // Filter out assistant messages containing unmatched tool_use
+  return filteredByPath.filter((message) => {
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      // Check if contains unmatched tool_use
+      const hasUnmatchedToolUse = message.content.some(
+        (part) => part.type === 'tool_use' && unmatchedIds.has(part.id),
+      );
+
+      if (hasUnmatchedToolUse) {
+        debug(
+          `[filterMessages] Filtering out assistant message ${message.uuid} with unmatched tool_use`,
+        );
+        return false;
+      }
+    }
+    return true;
+  });
 }
 
 export function loadSessionMessages(opts: {
   logPath: string;
+  raw?: boolean;
 }): NormalizedMessage[] {
   if (!fs.existsSync(opts.logPath)) {
     return [];
@@ -183,5 +267,71 @@ export function loadSessionMessages(opts: {
         );
       }
     });
+  if (opts.raw) {
+    return messages.filter(
+      (message: NormalizedMessage) => message.type === 'message',
+    );
+  }
   return filterMessages(messages);
+}
+
+/**
+ * Represents a JSONL snapshot entry with additional type field.
+ */
+export type SnapshotEntry = {
+  type: 'snapshot';
+} & SerializedSnapshot;
+
+/**
+ * Result of loading a session with snapshots.
+ */
+export type SessionWithSnapshots = {
+  messages: NormalizedMessage[];
+  snapshots: SerializedSnapshot[];
+};
+
+/**
+ * Loads session data including both messages and snapshots from JSONL file.
+ * Separates entries by type for independent processing.
+ *
+ * @param opts - Options containing the log file path
+ * @returns Object containing filtered messages and all snapshots
+ */
+export function loadSessionWithSnapshots(opts: {
+  logPath: string;
+}): SessionWithSnapshots {
+  if (!fs.existsSync(opts.logPath)) {
+    return { messages: [], snapshots: [] };
+  }
+
+  const content = fs.readFileSync(opts.logPath, 'utf-8');
+  const lines = content.split('\n').filter(Boolean);
+
+  const allMessages: NormalizedMessage[] = [];
+  const snapshots: SerializedSnapshot[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    try {
+      const parsed = JSON.parse(line);
+
+      if (parsed.type === 'snapshot') {
+        // Extract snapshot data without the 'type' field
+        const { type: _, ...snapshotData } = parsed;
+        snapshots.push(snapshotData as SerializedSnapshot);
+      } else if (parsed.type === 'message') {
+        allMessages.push(parsed as NormalizedMessage);
+      }
+      // Ignore other types like 'config'
+    } catch (e: any) {
+      throw new Error(
+        `Failed to parse line ${i + 1} of log file: ${opts.logPath}: ${e.message}`,
+      );
+    }
+  }
+
+  return {
+    messages: filterMessages(allMessages),
+    snapshots,
+  };
 }

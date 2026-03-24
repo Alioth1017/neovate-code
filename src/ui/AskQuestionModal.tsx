@@ -4,7 +4,6 @@ import type { Question } from '../tools/askUserQuestion';
 import { UI_COLORS } from './constants';
 import { SelectInput, type SelectOption } from './SelectInput';
 import type { ApprovalResult } from './store';
-import { useAppStore } from './store';
 import { useQuestionState } from './useQuestionState';
 import { useTerminalSize } from './useTerminalSize';
 
@@ -88,12 +87,6 @@ export function AskQuestionModal({
   // Keyboard navigation (Tab/Arrow keys to switch questions)
   useInput(
     (input, key) => {
-      // Handle terminal focus events
-      if (input === '[I' || input === '[O') {
-        useAppStore.getState().setWindowFocused(input === '[I');
-        return;
-      }
-
       if (isInTextInput && !isSubmitPage) return;
       if (key.return) return;
 
@@ -174,7 +167,7 @@ function QuestionNav({
   const isSingleHidden = questions.length === 1 && hideSubmitTab;
 
   return (
-    <Box flexDirection="row" marginBottom={1}>
+    <Box flexDirection="row" marginBottom={1} flexWrap="wrap">
       {!isSingleHidden && (
         <Text
           color={

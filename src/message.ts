@@ -9,6 +9,7 @@ export type SystemMessage = {
 export type TextPart = {
   type: 'text';
   text: string;
+  hidden?: boolean;
 };
 
 export type ImagePart = {
@@ -74,6 +75,9 @@ export type ToolResultPart2 = {
   result: ToolResult;
   agentId?: string;
   agentType?: string;
+  // Pruning related fields
+  pruned?: boolean; // Whether it has been pruned
+  prunedAt?: number; // Pruning timestamp
 };
 export type ToolContent = Array<ToolResultPart>;
 export type ToolResultPart = {
@@ -229,7 +233,7 @@ export function getMessageText(message: Message) {
   return typeof message.content === 'string'
     ? message.content
     : message.content
-        .filter((c) => c.type === 'text')
+        .filter((c): c is TextPart => c.type === 'text' && c.hidden !== true)
         .map((c) => c.text)
         .join('');
 }

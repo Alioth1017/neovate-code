@@ -1,13 +1,13 @@
 import { TOOL_NAMES } from './constants';
 import type { Context } from './context';
 import { JsonlLogger, RequestLogger } from './jsonl';
+import { getCurrentBranch } from './utils/git';
 import { LlmsContext } from './llmsContext';
 import { runLoop, type StreamResult, type ThinkingConfig } from './loop';
 import type { ImagePart, NormalizedMessage, UserContent } from './message';
-import { resolveModelWithContext } from './model';
+import { resolveModelWithContext } from './provider/model';
 import { OutputFormat } from './outputFormat';
 import { OutputStyleManager } from './outputStyle';
-import { generatePlanSystemPrompt } from './planSystemPrompt';
 import { PluginHookType } from './plugin';
 import { Session, SessionConfigManager, type SessionId } from './session';
 import { generateSystemPrompt } from './systemPrompt';
@@ -18,14 +18,17 @@ import type {
   ToolUse,
 } from './tool';
 import { resolveTools, Tools } from './tool';
-import type { Usage } from './usage';
+import { Usage } from './usage';
 import { randomUUID } from './utils/randomUUID';
 
 export class Project {
   session: Session;
   context: Context;
+  // For subagent to inherit parent session config
+  parentSessionId?: string;
   constructor(opts: {
     sessionId?: SessionId;
+    parentSessionId?: string;
     context: Context;
   }) {
     this.session = opts.sessionId
@@ -35,6 +38,7 @@ export class Project {
         })
       : Session.create();
     this.context = opts.context;
+    this.parentSessionId = opts.parentSessionId;
   }
 
   async send(
@@ -50,11 +54,13 @@ export class Project {
       onStreamResult?: (result: StreamResult) => Promise<void>;
       signal?: AbortSignal;
       attachments?: ImagePart[];
+      prependContent?: Array<{ type: 'text'; text: string; hidden?: boolean }>;
       parentUuid?: string;
       thinking?: ThinkingConfig;
+      outputStyle?: string;
     } = {},
   ) {
-    let tools = await resolveTools({
+    const tools = await resolveTools({
       context: this.context,
       sessionId: this.session.id,
       write: true,
@@ -62,16 +68,11 @@ export class Project {
       askUserQuestion: !this.context.config.quiet,
       signal: opts.signal,
       task: true,
-    });
-    tools = await this.context.apply({
-      hook: 'tool',
-      args: [{ sessionId: this.session.id }],
-      memo: tools,
-      type: PluginHookType.SeriesMerge,
+      isPlan: false,
     });
     const outputStyleManager = await OutputStyleManager.create(this.context);
     const outputStyle = outputStyleManager.getOutputStyle(
-      this.context.config.outputStyle,
+      opts.outputStyle ?? this.context.config.outputStyle,
       this.context.cwd,
     );
     const hasTaskTool = tools.some((t) => t.name === TOOL_NAMES.TASK);
@@ -95,55 +96,6 @@ export class Project {
     });
   }
 
-  async plan(
-    message: string | null,
-    opts: {
-      model?: string;
-      onMessage?: (opts: { message: NormalizedMessage }) => Promise<void>;
-      onTextDelta?: (text: string) => Promise<void>;
-      onChunk?: (chunk: any, requestId: string) => Promise<void>;
-      onStreamResult?: (result: StreamResult) => Promise<void>;
-      signal?: AbortSignal;
-      attachments?: ImagePart[];
-      parentUuid?: string;
-      thinking?: ThinkingConfig;
-    } = {},
-  ) {
-    let tools = await resolveTools({
-      context: this.context,
-      sessionId: this.session.id,
-      write: false,
-      todo: false,
-      askUserQuestion: !this.context.config.quiet,
-      signal: opts.signal,
-      task: false,
-    });
-    tools = await this.context.apply({
-      hook: 'tool',
-      args: [{ isPlan: true, sessionId: this.session.id }],
-      memo: tools,
-      type: PluginHookType.SeriesMerge,
-    });
-    let systemPrompt = generatePlanSystemPrompt({
-      todo: this.context.config.todo!,
-      productName: this.context.productName,
-      language: this.context.config.language,
-    });
-    systemPrompt = await this.context.apply({
-      hook: 'systemPrompt',
-      args: [{ isPlan: true, sessionId: this.session.id }],
-      memo: systemPrompt,
-      type: PluginHookType.SeriesLast,
-    });
-    return this.sendWithSystemPromptAndTools(message, {
-      ...opts,
-      model: opts.model || this.context.config.planModel,
-      tools,
-      systemPrompt,
-      onToolApprove: () => Promise.resolve(true),
-    });
-  }
-
   async sendWithSystemPromptAndTools(
     message: string | null,
     opts: {
@@ -162,6 +114,8 @@ export class Project {
       attachments?: ImagePart[];
       parentUuid?: string;
       thinking?: ThinkingConfig;
+      skipStopHook?: boolean;
+      prependContent?: Array<{ type: 'text'; text: string; hidden?: boolean }>;
     } = {},
   ) {
     const startTime = new Date();
@@ -177,6 +131,7 @@ export class Project {
     const requestLogger = new RequestLogger({
       globalProjectDir: this.context.paths.globalProjectDir,
     });
+    const gitBranch = await getCurrentBranch(this.context.cwd);
     if (message !== null) {
       message = await this.context.apply({
         hook: 'userPrompt',
@@ -209,13 +164,15 @@ export class Project {
           ?.uuid;
 
       let content: UserContent = message;
-      if (opts.attachments?.length) {
+
+      if (opts.prependContent?.length || opts.attachments?.length) {
         content = [
+          ...(opts.prependContent ?? []),
           {
             type: 'text' as const,
             text: message,
           },
-          ...opts.attachments,
+          ...(opts.attachments ?? []),
         ];
       }
 
@@ -230,6 +187,7 @@ export class Project {
       const userMessageWithSessionId = {
         ...userMessage,
         sessionId: this.session.id,
+        ...(gitBranch ? { gitBranch } : {}),
       };
       jsonlLogger.addMessage({
         message: userMessageWithSessionId,
@@ -301,12 +259,14 @@ export class Project {
       llmsContexts: llmsContext.messages,
       signal: opts.signal,
       autoCompact: this.context.config.autoCompact,
+      language: this.context.config.language,
       thinking: opts.thinking,
       temperature: this.context.config.temperature,
       onMessage: async (message) => {
         const normalizedMessage = {
           ...message,
           sessionId: this.session.id,
+          ...(gitBranch ? { gitBranch } : {}),
         };
         outputFormat.onMessage({
           message: normalizedMessage,
@@ -336,6 +296,23 @@ export class Project {
       onChunk: async (chunk, requestId) => {
         requestLogger.logChunk(requestId, chunk);
         await opts.onChunk?.(chunk, requestId);
+      },
+      onRequest: (req) => {
+        requestLogger.logRequest({
+          requestId: req.requestId,
+          url: req.url,
+          method: req.method,
+          headers: req.headers,
+          body: req.body,
+        });
+      },
+      onResponse: (res) => {
+        requestLogger.logResponse({
+          requestId: res.requestId,
+          url: res.url,
+          status: res.status,
+          headers: res.headers,
+        });
       },
       onText: async (text) => {},
       onReasoning: async (text) => {},
@@ -416,8 +393,11 @@ export class Project {
           }
         }
         // 4. if category is edit check autoEdit config (including session config)
+        // Read parent session config first, so subagent can inherit parent agent's approval settings
+        // If there is no parent (independent agent), use its own session
+        const sessionIdToCheck = this.parentSessionId || this.session.id;
         const sessionConfigManager = new SessionConfigManager({
-          logPath: this.context.paths.getSessionLogPath(this.session.id),
+          logPath: this.context.paths.getSessionLogPath(sessionIdToCheck),
         });
         if (tool.approval?.category === 'write') {
           if (
@@ -454,6 +434,23 @@ export class Project {
       ],
       type: PluginHookType.Series,
     });
+    if (!opts.skipStopHook) {
+      await this.context.apply({
+        hook: 'stop',
+        args: [
+          {
+            sessionId: this.session.id,
+            result,
+            usage: result.success ? result.data.usage : Usage.empty(),
+            turnsCount: result.success ? result.metadata.turnsCount : 0,
+            toolCallsCount: result.success ? result.metadata.toolCallsCount : 0,
+            duration: result.success ? result.metadata.duration : 0,
+            model: `${resolvedModel.provider.id}/${resolvedModel.model.id}`,
+          },
+        ],
+        type: PluginHookType.Series,
+      });
+    }
     outputFormat.onEnd({
       result,
       sessionId: this.session.id,

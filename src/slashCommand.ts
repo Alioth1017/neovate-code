@@ -12,6 +12,7 @@ import {
   type PromptCommand,
   type SlashCommand,
 } from './slash-commands/types';
+import { SkillSource, type SkillMetadata, type SkillManager } from './skill';
 
 export type SlashCommandManagerOpts = {
   paths: Paths;
@@ -20,6 +21,7 @@ export type SlashCommandManagerOpts = {
   argvConfig: Record<string, any>;
   language: string;
   askUserQuestion?: boolean;
+  skillManager?: SkillManager;
 };
 
 export type CommandEntry = {
@@ -82,6 +84,16 @@ export class SlashCommandManager {
     project.forEach((command) => {
       commands.set(command.command.name, command);
     });
+    // 7. skills (only add if no existing command with same name)
+    if (opts.skillManager) {
+      const skills = opts.skillManager.getSkills();
+      for (const skill of skills) {
+        if (!commands.has(skill.name)) {
+          const entry = this.#skillToCommandEntry(skill, opts.skillManager);
+          commands.set(skill.name, entry);
+        }
+      }
+    }
     this.commands = commands;
   }
 
@@ -99,6 +111,7 @@ export class SlashCommandManager {
       argvConfig: context.argvConfig,
       language: context.config.language,
       askUserQuestion: !context.config.quiet,
+      skillManager: context.skillManager,
     });
   }
 
@@ -164,26 +177,37 @@ export class SlashCommandManager {
     file: NormalizedMarkdownFile,
     descriptionPostfix: string,
   ): PromptCommand {
+    return fileToPromptCommand(file, descriptionPostfix);
+  }
+
+  #skillToCommandEntry(
+    skill: SkillMetadata,
+    skillManager: SkillManager,
+  ): CommandEntry {
+    const skillDir = path.dirname(skill.path);
+    const isGlobal =
+      skill.source === SkillSource.Global ||
+      skill.source === SkillSource.GlobalClaude;
+    const source = isGlobal ? CommandSource.User : CommandSource.Project;
+    const descriptionPostfix = isGlobal ? 'global skill' : 'project skill';
+
     const command: PromptCommand = {
       type: 'prompt',
-      name: file.name,
-      description: file.description + ' (' + descriptionPostfix + ')',
-      model: file.attributes.model,
-      progressMessage:
-        file.attributes.progressMessage || 'Executing command...',
+      name: skill.name,
+      description: skill.description + ' (' + descriptionPostfix + ')',
+      progressMessage: 'Executing skill...',
       getPromptForCommand: async (args) => {
-        let prompt = file.body.trim();
+        const body = await skillManager.readSkillBody(skill);
+        let prompt = `Base directory for this skill: ${skillDir}\n\n${body.trim()}`;
+
         // Check if prompt contains positional parameters ($1, $2, etc.)
         const hasPositionalParams = /\$[1-9]\d*/.test(prompt);
 
         if (hasPositionalParams) {
-          // Replace positional parameters
           prompt = replaceParameterPlaceholders(prompt, args);
         } else if (prompt.includes('$ARGUMENTS')) {
-          // Legacy $ARGUMENTS support
           prompt = prompt.replace(/\$ARGUMENTS/g, args || '');
         } else if (args.trim()) {
-          // If no placeholders but args provided, append them
           prompt += `\n\nArguments: ${args}`;
         }
 
@@ -195,7 +219,8 @@ export class SlashCommandManager {
         ];
       },
     };
-    return command;
+
+    return { command, source };
   }
 }
 
@@ -212,16 +237,60 @@ export function parseSlashCommand(input: string): {
 } {
   const trimmed = input.trim();
   const spaceIndex = trimmed.indexOf(' ');
-  if (spaceIndex === -1) {
+  const newlineIndex = trimmed.indexOf('\n');
+  let separatorIndex: number;
+  if (spaceIndex === -1 && newlineIndex === -1) {
+    separatorIndex = -1;
+  } else if (spaceIndex === -1) {
+    separatorIndex = newlineIndex;
+  } else if (newlineIndex === -1) {
+    separatorIndex = spaceIndex;
+  } else {
+    separatorIndex = Math.min(spaceIndex, newlineIndex);
+  }
+  if (separatorIndex === -1) {
     return {
       command: trimmed.slice(1),
       args: '',
     };
   }
   return {
-    command: trimmed.slice(1, spaceIndex),
-    args: trimmed.slice(spaceIndex + 1).trim(),
+    command: trimmed.slice(1, separatorIndex),
+    args: trimmed.slice(separatorIndex + 1).trim(),
   };
+}
+
+export function fileToPromptCommand(
+  file: NormalizedMarkdownFile,
+  descriptionPostfix: string,
+): PromptCommand {
+  const command: PromptCommand = {
+    type: 'prompt',
+    name: file.name,
+    description: file.description + ' (' + descriptionPostfix + ')',
+    model: file.attributes.model,
+    progressMessage: file.attributes.progressMessage || 'Executing command...',
+    getPromptForCommand: async (args) => {
+      let prompt = file.body.trim();
+      const hasPositionalParams = /\$[1-9]\d*/.test(prompt);
+
+      if (hasPositionalParams) {
+        prompt = replaceParameterPlaceholders(prompt, args);
+      } else if (prompt.includes('$ARGUMENTS')) {
+        prompt = prompt.replace(/\$ARGUMENTS/g, args || '');
+      } else if (args.trim()) {
+        prompt += `\n\nArguments: ${args}`;
+      }
+
+      return [
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ];
+    },
+  };
+  return command;
 }
 
 export function replaceParameterPlaceholders(

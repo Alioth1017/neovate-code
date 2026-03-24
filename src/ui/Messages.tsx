@@ -25,6 +25,7 @@ import { symbols } from '../utils/symbols';
 import { AgentProgress } from './AgentProgress';
 import { SPACING, UI_COLORS } from './constants';
 import { DiffViewer } from './DiffViewer';
+import { ExitPlanModeDisplay } from './PlanMode/ExitPlanModeDisplay';
 import { ExpandableOutput } from './ExpandableOutput';
 import { GradientString } from './GradientString';
 import { Markdown } from './Markdown';
@@ -284,6 +285,85 @@ function GettingStartedTips() {
       <Text>
         4. <Text bold>/help</Text> for more information
       </Text>
+    </Box>
+  );
+}
+
+function ModelConfigurationWarning() {
+  const { model, providers, initializeModelError } = useAppStore();
+  if (model) {
+    return null;
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Box
+        flexDirection="column"
+        marginTop={1}
+        borderStyle="round"
+        borderColor="yellow"
+        padding={1}
+      >
+        <Text bold color="yellow">
+          ! Model Configuration Required
+        </Text>
+        <Box marginTop={1} flexDirection="column">
+          <Text>
+            You haven't configured a model yet. Here are available providers:
+          </Text>
+        </Box>
+        <Box marginTop={1} flexDirection="column">
+          {Object.values(providers).map((provider) => {
+            const enrichedProvider = provider as unknown as EnrichedProvider;
+            const descriptions: string[] = [];
+
+            // Add valid environment variables info
+            if (
+              enrichedProvider.validEnvs &&
+              enrichedProvider.validEnvs.length > 0
+            ) {
+              descriptions.push(
+                `${symbols.tick} Envs: ${enrichedProvider.validEnvs.join(', ')}`,
+              );
+            }
+
+            // Add API key status
+            if (enrichedProvider.hasApiKey) {
+              descriptions.push(`${symbols.tick} Logged`);
+            }
+
+            const description = descriptions.join(' | ');
+
+            return (
+              <Box key={enrichedProvider.id}>
+                <Text color="cyan">
+                  {symbols.bullet} {enrichedProvider.name}
+                </Text>
+                {description && <Text> → {pc.gray(`(${description})`)}</Text>}
+              </Box>
+            );
+          })}
+        </Box>
+        <Box marginTop={1} flexDirection="column">
+          <Text>Suggested actions:</Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text>
+              {symbols.bullet}{' '}
+              <Text bold color="cyan">
+                /login
+              </Text>{' '}
+              - Configure API key for a provider
+            </Text>
+            <Text>
+              {symbols.bullet}{' '}
+              <Text bold color="cyan">
+                /model
+              </Text>{' '}
+              - Select a model to use
+            </Text>
+          </Box>
+        </Box>
+      </Box>
       {initializeModelError && (
         <Box marginTop={1}>
           <Text color="red">
@@ -291,83 +371,6 @@ function GettingStartedTips() {
           </Text>
         </Box>
       )}
-    </Box>
-  );
-}
-
-function ModelConfigurationWarning() {
-  const { model, providers } = useAppStore();
-  if (model) {
-    return null;
-  }
-
-  return (
-    <Box
-      flexDirection="column"
-      marginTop={1}
-      borderStyle="round"
-      borderColor="yellow"
-      padding={1}
-    >
-      <Text bold color="yellow">
-        ! Model Configuration Required
-      </Text>
-      <Box marginTop={1} flexDirection="column">
-        <Text>
-          You haven't configured a model yet. Here are available providers:
-        </Text>
-      </Box>
-      <Box marginTop={1} flexDirection="column">
-        {Object.values(providers).map((provider) => {
-          const enrichedProvider = provider as unknown as EnrichedProvider;
-          const descriptions: string[] = [];
-
-          // Add valid environment variables info
-          if (
-            enrichedProvider.validEnvs &&
-            enrichedProvider.validEnvs.length > 0
-          ) {
-            descriptions.push(
-              `${symbols.tick} Envs: ${enrichedProvider.validEnvs.join(', ')}`,
-            );
-          }
-
-          // Add API key status
-          if (enrichedProvider.hasApiKey) {
-            descriptions.push(`${symbols.tick} Logged`);
-          }
-
-          const description = descriptions.join(' | ');
-
-          return (
-            <Box key={enrichedProvider.id}>
-              <Text color="cyan">
-                {symbols.bullet} {enrichedProvider.name}
-              </Text>
-              {description && <Text> → {pc.gray(`(${description})`)}</Text>}
-            </Box>
-          );
-        })}
-      </Box>
-      <Box marginTop={1} flexDirection="column">
-        <Text>Suggested actions:</Text>
-        <Box marginTop={1} flexDirection="column">
-          <Text>
-            {symbols.bullet}{' '}
-            <Text bold color="cyan">
-              /login
-            </Text>{' '}
-            - Configure API key for a provider
-          </Text>
-          <Text>
-            {symbols.bullet}{' '}
-            <Text bold color="cyan">
-              /model
-            </Text>{' '}
-            - Select a model to use
-          </Text>
-        </Box>
-      </Box>
     </Box>
   );
 }
@@ -436,17 +439,30 @@ function AssistantText({
 
 function ToolUse({ part }: { part: ToolUsePart }) {
   const { name, displayName } = part;
+  const { transcriptMode } = useAppStore();
   const description = part.description;
+
+  // Truncate description when not in transcript mode
+  const displayDescription = useMemo(() => {
+    if (!description) return undefined;
+    if (transcriptMode) return description;
+    return description.length > 100
+      ? `${description.substring(0, 97)}...`
+      : description;
+  }, [description, transcriptMode]);
+
   return (
-    <Box marginTop={SPACING.MESSAGE_MARGIN_TOP}>
-      <Text>
-        <Text bold color={UI_COLORS.TOOL}>
-          {displayName || name}
-        </Text>
-        {description && (
-          <Text color={UI_COLORS.TOOL_DESCRIPTION}>({description})</Text>
-        )}
+    <Box
+      marginTop={SPACING.MESSAGE_MARGIN_TOP}
+      flexDirection="row"
+      flexWrap="wrap"
+    >
+      <Text bold color={UI_COLORS.TOOL}>
+        {displayName || name}
       </Text>
+      {displayDescription && (
+        <Text color={UI_COLORS.TOOL_DESCRIPTION}>({displayDescription})</Text>
+      )}
     </Box>
   );
 }
@@ -456,6 +472,16 @@ function ToolPair({ pair }: { pair: ToolPair }) {
   if (pair.toolUse.name === TOOL_NAMES.TASK) {
     return (
       <AgentProgress toolUse={pair.toolUse} toolResult={pair.toolResult} />
+    );
+  }
+
+  // If it's exitPlanMode tool, use ExitPlanModeDisplay component
+  if (pair.toolUse.name === TOOL_NAMES.EXIT_PLAN_MODE) {
+    return (
+      <ExitPlanModeDisplay
+        toolUse={pair.toolUse}
+        toolResult={pair.toolResult}
+      />
     );
   }
 
@@ -566,14 +592,38 @@ function AssistantWithTools({
 }
 
 function Thinking({ text }: { text: string }) {
+  const { transcriptMode } = useAppStore();
+
+  const { displayText, hiddenCount, shouldTruncate } = useMemo(() => {
+    const lines = text.split('\n');
+    const maxLines = 2;
+    const shouldTruncate = !transcriptMode && lines.length > maxLines;
+
+    if (!shouldTruncate) {
+      return { displayText: text, hiddenCount: 0, shouldTruncate: false };
+    }
+
+    return {
+      displayText: lines.slice(0, maxLines).join('\n'),
+      hiddenCount: lines.length - maxLines,
+      shouldTruncate: true,
+    };
+  }, [text, transcriptMode]);
+
   return (
     <Box flexDirection="column" marginTop={SPACING.MESSAGE_MARGIN_TOP}>
       <Text bold color="gray">
         thinking
       </Text>
       <Text color="gray" italic>
-        {text}
+        {displayText}
       </Text>
+      {shouldTruncate && (
+        <Text color="gray" dimColor>
+          ... {hiddenCount} more line{hiddenCount === 1 ? '' : 's'} hidden
+          (Press ctrl+o to expand) ...
+        </Text>
+      )}
     </Box>
   );
 }

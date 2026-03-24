@@ -1,8 +1,9 @@
 import { Box, Text } from 'ink';
 import os from 'os';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { SPACING, UI_COLORS } from './constants';
 import { DebugRandomNumber } from './Debug';
+import { GradientText } from './GradientText';
 import { MemoryModal } from './MemoryModal';
 import { ModeIndicator } from './ModeIndicator';
 import { ReverseSearchInput } from './ReverseSearchInput';
@@ -13,7 +14,18 @@ import TextInput from './TextInput';
 import { useExternalEditor } from './useExternalEditor';
 import { useInputHandlers } from './useInputHandlers';
 import { useTerminalSize } from './useTerminalSize';
+import { useTextGradientAnimation } from './useTextGradientAnimation';
 import { useTryTips } from './useTryTips';
+
+function SearchingIndicator() {
+  const text = 'Searching...';
+  const highlightIndex = useTextGradientAnimation(text, true);
+  return (
+    <Box marginLeft={2}>
+      <GradientText text={text} highlightIndex={highlightIndex} />
+    </Box>
+  );
+}
 
 export function ChatInput() {
   const {
@@ -26,15 +38,6 @@ export function ChatInput() {
   } = useInputHandlers();
   const { currentTip } = useTryTips();
 
-  // Enable terminal focus reporting
-  useEffect(() => {
-    if (!process.stdin.isTTY) return;
-    process.stdout.write('\x1b[?1004h');
-    return () => {
-      process.stdout.write('\x1b[?1004l');
-    };
-  }, []);
-
   // Memoize platform-specific modifier key to avoid repeated os.platform() calls
   const modifierKey = useMemo(
     () => (os.platform() === 'darwin' ? 'option+up' : 'alt+up'),
@@ -43,7 +46,6 @@ export function ChatInput() {
   const {
     log,
     setExitMessage,
-    planResult,
     cancel,
     slashCommandJSX,
     approvalModal,
@@ -73,7 +75,7 @@ export function ChatInput() {
 
   const showSuggestions =
     slashCommands.suggestions.length > 0 ||
-    fileSuggestion.matchedPaths.length > 0;
+    fileSuggestion.suggestions.length > 0;
 
   const [reverseSearchMatch, setReverseSearchMatch] = useState('');
 
@@ -142,7 +144,8 @@ export function ChatInput() {
 
   // Get border color based on mode
   const borderColor = useMemo(() => {
-    if (thinking?.effort === 'high') return UI_COLORS.CHAT_BORDER_THINKING_HARD;
+    if (thinking?.effort === 'max' || thinking?.effort === 'xhigh')
+      return UI_COLORS.CHAT_BORDER_THINKING_HARD;
     if (mode === 'memory') return UI_COLORS.CHAT_BORDER_MEMORY;
     if (mode === 'bash') return UI_COLORS.CHAT_BORDER_BASH;
     return UI_COLORS.CHAT_BORDER;
@@ -156,9 +159,6 @@ export function ChatInput() {
   }, [mode]);
 
   if (slashCommandJSX) {
-    return null;
-  }
-  if (planResult) {
     return null;
   }
   if (approvalModal) {
@@ -258,40 +258,47 @@ export function ChatInput() {
           maxVisible={10}
         >
           {(suggestion, isSelected, _visibleSuggestions) => {
-            const maxNameLength = Math.max(
-              ...slashCommands.suggestions.map((s) => s.command.name.length),
+            // Use maxNameWidth from hook (+1 for '/' prefix, +3 for spacing)
+            const firstColumnWidth = Math.min(
+              slashCommands.maxNameWidth + 4,
+              columns - 10,
             );
             return (
               <SuggestionItem
                 name={`/${suggestion.command.name}`}
                 description={suggestion.command.description}
                 isSelected={isSelected}
-                firstColumnWidth={Math.min(maxNameLength + 4, columns - 10)}
+                firstColumnWidth={firstColumnWidth}
+                maxWidth={columns}
               />
             );
           }}
         </Suggestion>
       )}
-      {fileSuggestion.matchedPaths.length > 0 && (
+      {fileSuggestion.suggestions.length > 0 && (
         <Suggestion
-          suggestions={fileSuggestion.matchedPaths}
+          suggestions={fileSuggestion.suggestions}
           selectedIndex={fileSuggestion.selectedIndex}
           maxVisible={10}
         >
           {(suggestion, isSelected, _visibleSuggestions) => {
             const maxNameLength = Math.max(
-              ...fileSuggestion.matchedPaths.map((s) => s.length),
+              ...fileSuggestion.suggestions.map((s) => s.displayText.length),
             );
             return (
               <SuggestionItem
-                name={suggestion}
-                description={''}
+                name={suggestion.displayText}
+                description={suggestion.description ?? ''}
                 isSelected={isSelected}
                 firstColumnWidth={Math.min(maxNameLength + 4, columns - 10)}
+                maxWidth={columns}
               />
             );
           }}
         </Suggestion>
+      )}
+      {fileSuggestion.isLoading && fileSuggestion.suggestions.length === 0 && (
+        <SearchingIndicator />
       )}
     </Box>
   );

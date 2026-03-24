@@ -1,9 +1,9 @@
 import type {
-  LanguageModelV2,
-  LanguageModelV2FunctionTool,
-  LanguageModelV2Message,
-  LanguageModelV2Prompt,
-  SharedV2Headers,
+  LanguageModelV3,
+  LanguageModelV3FunctionTool,
+  LanguageModelV3Message,
+  LanguageModelV3Prompt,
+  SharedV3Headers,
 } from '@ai-sdk/provider';
 import createDebug from 'debug';
 import { At } from './at';
@@ -14,9 +14,8 @@ import {
   type NormalizedMessage,
   type ToolUsePart,
 } from './message';
-import type { ModelInfo } from './model';
+import type { ModelInfo } from './provider/model';
 import { addPromptCache } from './promptCache';
-import { getThinkingConfig, type ReasoningEffort } from './thinking-config';
 import type {
   ToolApprovalResult,
   ToolParams,
@@ -76,16 +75,16 @@ export type LoopResult =
 
 type StreamResultBase = {
   requestId: string;
-  prompt: LanguageModelV2Prompt;
+  prompt: LanguageModelV3Prompt;
   model: ModelInfo;
-  tools: LanguageModelV2FunctionTool[];
+  tools: LanguageModelV3FunctionTool[];
 };
 export type StreamResult = StreamResultBase & {
   request?: {
     body?: unknown;
   };
   response?: {
-    headers?: SharedV2Headers;
+    headers?: SharedV3Headers;
     statusCode?: number;
     body?: unknown;
   };
@@ -102,9 +101,25 @@ export type ResponseFormat =
       name?: string;
       description?: string;
     };
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'max' | 'xhigh';
 export type ThinkingConfig = {
   effort: ReasoningEffort;
 };
+
+export type OnRequestHook = (req: {
+  requestId: string;
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: unknown;
+}) => void;
+
+export type OnResponseHook = (res: {
+  requestId: string;
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+}) => void;
 
 type RunLoopOpts = {
   input: string | NormalizedMessage[];
@@ -117,6 +132,7 @@ type RunLoopOpts = {
   signal?: AbortSignal;
   llmsContexts?: string[];
   autoCompact?: boolean;
+  language?: string;
   thinking?: ThinkingConfig;
   temperature?: number;
   responseFormat?: ResponseFormat;
@@ -138,6 +154,8 @@ type RunLoopOpts = {
   }) => Promise<void>;
   onToolApprove?: (toolUse: ToolUse) => Promise<ToolApprovalResult>;
   onMessage?: OnMessage;
+  onRequest?: OnRequestHook;
+  onResponse?: OnResponseHook;
 };
 
 export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
@@ -166,6 +184,24 @@ export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
   const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
   const abortController = new AbortController();
 
+  // Listen to external signal and synchronize with internal abortController
+  // This ensures that when session.cancel is triggered, the LLM request is immediately aborted
+  const abortHandler = () => {
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
+  };
+  if (opts.signal) {
+    opts.signal.addEventListener('abort', abortHandler, { once: true });
+  }
+
+  // Cleanup function to remove event listener
+  const cleanup = () => {
+    if (opts.signal) {
+      opts.signal.removeEventListener('abort', abortHandler);
+    }
+  };
+
   const createCancelError = (): LoopResult => ({
     success: false,
     error: {
@@ -175,457 +211,593 @@ export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
     },
   });
 
-  let shouldAtNormalize = true;
-  let shouldThinking = true;
-  while (true) {
-    // Must use separate abortController to prevent ReadStream locking
-    if (opts.signal?.aborted && !abortController.signal.aborted) {
-      abortController.abort();
-      return createCancelError();
-    }
-
-    const startTime = new Date();
-    turnsCount++;
-
-    if (turnsCount > maxTurns) {
-      return {
-        success: false,
-        error: {
-          type: 'max_turns_exceeded',
-          message: `Maximum turns (${maxTurns}) exceeded`,
-          details: {
-            turnsCount,
-            history,
-            usage: totalUsage,
-          },
-        },
-      };
-    }
-    if (opts.autoCompact) {
-      const compressed = await history.compress(opts.model);
-      if (compressed.compressed) {
-        debug('history compressed', compressed);
+  try {
+    let shouldAtNormalize = true;
+    let shouldThinking = true;
+    while (true) {
+      // Must use separate abortController to prevent ReadStream locking
+      if (opts.signal?.aborted && !abortController.signal.aborted) {
+        abortController.abort();
+        return createCancelError();
       }
-    }
-    lastUsage.reset();
 
-    const systemPromptMessage = {
-      role: 'system',
-      content: opts.systemPrompt || '',
-    } as LanguageModelV2Message;
-    const llmsContexts = opts.llmsContexts || [];
-    const llmsContextMessages = llmsContexts.map((llmsContext) => {
-      return {
+      const startTime = new Date();
+      turnsCount++;
+
+      if (turnsCount > maxTurns) {
+        return {
+          success: false,
+          error: {
+            type: 'max_turns_exceeded',
+            message: `Maximum turns (${maxTurns}) exceeded`,
+            details: {
+              turnsCount,
+              history,
+              usage: totalUsage,
+            },
+          },
+        };
+      }
+      if (opts.autoCompact) {
+        const compressed = await history.compress(opts.model, opts.language);
+        if (compressed.compressed) {
+          debug('history compressed', compressed);
+        }
+      }
+      lastUsage.reset();
+
+      const systemPromptMessage = {
         role: 'system',
-        content: llmsContext,
-      } as LanguageModelV2Message;
-    });
-    let prompt: LanguageModelV2Prompt = [
-      systemPromptMessage,
-      ...llmsContextMessages,
-      ...history.toLanguageV2Messages(),
-    ];
-
-    if (shouldAtNormalize) {
-      // add file and directory contents for the last user prompt
-      prompt = At.normalizeLanguageV2Prompt({
-        input: prompt,
-        cwd: opts.cwd,
+        content: opts.systemPrompt || '',
+      } as LanguageModelV3Message;
+      const llmsContexts = opts.llmsContexts || [];
+      const llmsContextMessages = llmsContexts.map((llmsContext) => {
+        return {
+          role: 'system',
+          content: llmsContext,
+        } as LanguageModelV3Message;
       });
-      shouldAtNormalize = false;
-    }
+      let prompt: LanguageModelV3Prompt = [
+        systemPromptMessage,
+        ...llmsContextMessages,
+        ...history.toLanguageV3Messages(),
+      ];
 
-    prompt = addPromptCache(prompt, opts.model);
+      if (shouldAtNormalize) {
+        // add file and directory contents for the last user prompt
+        prompt = At.normalizeLanguageV2Prompt({
+          input: prompt,
+          cwd: opts.cwd,
+        });
+        shouldAtNormalize = false;
+      }
 
-    let text = '';
-    let reasoning = '';
-    const toolCalls: Array<{
-      providerMetadata?: any;
-      toolCallId: string;
-      toolName: string;
-      input: string;
-    }> = [];
+      prompt = addPromptCache(prompt, opts.model);
 
-    const requestId = randomUUID();
-    const m: LanguageModelV2 = await opts.model._mCreator();
-    const tools = opts.tools.toLanguageV2Tools();
+      let text = '';
+      let reasoning = '';
+      const toolCalls: Array<{
+        providerMetadata?: any;
+        toolCallId: string;
+        toolName: string;
+        input: string;
+      }> = [];
 
-    // Get thinking config based on model's reasoning capability
-    let thinkingConfig: Record<string, any> | undefined = undefined;
-    if (shouldThinking && opts.thinking) {
-      thinkingConfig = getThinkingConfig(opts.model, opts.thinking.effort);
-      shouldThinking = false;
-    }
+      const requestId = randomUUID();
+      const m: LanguageModelV3 = await opts.model._mCreator({
+        onRequest: opts.onRequest
+          ? (req) => opts.onRequest!({ ...req, requestId })
+          : undefined,
+        onResponse: opts.onResponse
+          ? (res) => opts.onResponse!({ ...res, requestId })
+          : undefined,
+      });
+      const tools = opts.tools.toLanguageV2Tools();
 
-    let retryCount = 0;
-    const errorRetryTurns = opts.errorRetryTurns ?? DEFAULT_ERROR_RETRY_TURNS;
-    let reasoningProviderMetadata: any | undefined = undefined;
+      // Get thinking config from model variants
+      let thinkingConfig: Record<string, any> | undefined = undefined;
+      let providerId = opts.model.provider.id;
+      if (providerId === 'codex') {
+        providerId = 'openai';
+      }
+      if (shouldThinking && opts.thinking) {
+        thinkingConfig = {
+          providerOptions: {
+            [providerId]: opts.model.model.variants?.[opts.thinking.effort],
+          },
+        };
+        shouldThinking = false;
+      }
 
-    while (retryCount <= errorRetryTurns) {
+      let retryCount = 0;
+      const errorRetryTurns = opts.errorRetryTurns ?? DEFAULT_ERROR_RETRY_TURNS;
+      let reasoningProviderMetadata: any | undefined = undefined;
+
+      while (retryCount <= errorRetryTurns) {
+        if (opts.signal?.aborted) {
+          return createCancelError();
+        }
+
+        try {
+          const result = await m.doStream({
+            prompt: prompt,
+            tools,
+            toolChoice: { type: 'auto' },
+            abortSignal: abortController.signal,
+            ...thinkingConfig,
+            ...(opts.temperature !== undefined && {
+              temperature: opts.temperature,
+            }),
+            ...(opts.responseFormat !== undefined && {
+              responseFormat: opts.responseFormat,
+            }),
+          });
+          opts.onStreamResult?.({
+            requestId,
+            prompt,
+            model: opts.model,
+            tools,
+            request: result.request,
+            response: result.response,
+          });
+
+          let finishChunkReceived = false;
+          for await (const chunk of result.stream) {
+            if (opts.signal?.aborted) {
+              return createCancelError();
+            }
+            await opts.onChunk?.(chunk, requestId);
+            switch (chunk.type) {
+              case 'text-delta': {
+                const textDelta = chunk.delta;
+                text += textDelta;
+                await opts.onTextDelta?.(textDelta);
+                break;
+              }
+              case 'reasoning-delta':
+                reasoning += chunk.delta;
+                break;
+              case 'reasoning-end':
+                if (chunk.providerMetadata) {
+                  reasoningProviderMetadata = chunk.providerMetadata;
+                }
+                break;
+              case 'tool-call':
+                toolCalls.push({
+                  toolCallId: chunk.toolCallId,
+                  toolName: chunk.toolName,
+                  input: chunk.input,
+                  ...(chunk.providerMetadata && {
+                    providerMetadata: chunk.providerMetadata,
+                  }),
+                });
+                break;
+              case 'finish':
+                finishChunkReceived = true;
+                lastUsage = Usage.fromEventUsage(chunk.usage);
+                totalUsage.add(lastUsage);
+                if (toolCalls.length === 0 && text.trim() === '') {
+                  const error = new Error(
+                    'Empty response: no text or tool calls received',
+                  );
+                  (error as any).isRetryable = true;
+                  throw error;
+                }
+                break;
+              case 'error': {
+                const message = (() => {
+                  if ((chunk as any).error.message) {
+                    return (chunk as any).error.message;
+                  }
+                  try {
+                    const message = JSON.parse(
+                      (chunk as any).error.value?.details,
+                    )?.error?.message;
+                    if (message) {
+                      return message;
+                    }
+                  } catch (_e) {}
+                  return JSON.stringify(chunk.error);
+                })();
+                const error = new Error(message);
+                (error as any).isRetryable = false;
+                const value = (chunk.error as any).value;
+                if (value) {
+                  (error as any).statusCode = value?.status;
+                }
+                throw error;
+              }
+              default:
+                break;
+            }
+          }
+
+          if (
+            !finishChunkReceived &&
+            toolCalls.length === 0 &&
+            text.trim() === ''
+          ) {
+            const error = new Error(
+              'Empty response: stream ended without any chunks',
+            );
+            (error as any).isRetryable = true;
+            throw error;
+          }
+
+          break;
+        } catch (error: any) {
+          const nextRetryCount = retryCount + 1;
+          const retryDelayMs = 1000 * Math.pow(2, nextRetryCount - 1);
+          const retryStartTime = Date.now();
+          let isRetryable = error.isRetryable;
+          const data = error.data || error.message;
+          // Antigravity: Requested entity was not found.
+          if (data === 'Not Found') {
+            isRetryable = true;
+          }
+          opts.onStreamResult?.({
+            requestId,
+            prompt,
+            model: opts.model,
+            tools,
+            response: {
+              statusCode: error.statusCode,
+              headers: error.responseHeaders,
+              body: error.responseBody,
+            },
+            error: {
+              data: error.data || error.message,
+              isRetryable,
+              retryAttempt: retryCount,
+              maxRetries: errorRetryTurns,
+              retryDelayMs,
+              retryStartTime,
+            },
+          });
+
+          if (isRetryable && retryCount < errorRetryTurns) {
+            retryCount++;
+            try {
+              await exponentialBackoffWithCancellation(retryCount, opts.signal);
+            } catch {
+              return createCancelError();
+            }
+            continue;
+          }
+
+          let parsedResponseBody: {
+            error?: { message?: string; metadata?: unknown };
+          } | null = null;
+          if (typeof error.responseBody === 'string') {
+            try {
+              parsedResponseBody = JSON.parse(error.responseBody);
+            } catch {}
+          }
+          return {
+            success: false,
+            error: {
+              type: 'api_error',
+              message:
+                parsedResponseBody?.error?.message ??
+                (error instanceof Error
+                  ? error.message
+                  : 'Unknown streaming error'),
+              details: {
+                code: error.data?.error?.code,
+                status: error.data?.error?.status,
+                url: error.url,
+                error,
+                stack: error.stack,
+                retriesAttempted: retryCount,
+                ...(parsedResponseBody?.error?.metadata
+                  ? {
+                      metadata: parsedResponseBody.error.metadata,
+                    }
+                  : {}),
+              },
+            },
+          };
+        }
+      }
+
+      // Exit early if cancellation signal is received
       if (opts.signal?.aborted) {
         return createCancelError();
       }
 
-      try {
-        const result = await m.doStream({
-          prompt: prompt,
-          tools,
-          toolChoice: { type: 'auto' },
-          abortSignal: abortController.signal,
-          ...thinkingConfig,
-          ...(opts.temperature !== undefined && {
-            temperature: opts.temperature,
+      await opts.onText?.(text);
+
+      // some model may return multiple \n in the end of the reasoning
+      // e.g. antigravity/gemini-3-pro-high
+      if (reasoning) {
+        reasoning = reasoning.trim();
+      }
+
+      if (reasoning) {
+        await opts.onReasoning?.(reasoning);
+      }
+
+      const endTime = new Date();
+      opts.onTurn?.({
+        usage: lastUsage,
+        startTime,
+        endTime,
+      });
+      const model = `${opts.model.provider.id}/${opts.model.model.id}`;
+      const assistantContent: AssistantContent = [];
+      if (reasoning) {
+        assistantContent.push({
+          type: 'reasoning',
+          text: reasoning,
+          ...(reasoningProviderMetadata && {
+            providerMetadata: reasoningProviderMetadata,
           }),
-          ...(opts.responseFormat !== undefined && {
-            responseFormat: opts.responseFormat,
-          }),
         });
-        opts.onStreamResult?.({
-          requestId,
-          prompt,
-          model: opts.model,
-          tools,
-          request: result.request,
-          response: result.response,
+      }
+      if (text) {
+        finalText = text;
+        assistantContent.push({
+          type: 'text',
+          text: text,
         });
-
-        for await (const chunk of result.stream) {
-          if (opts.signal?.aborted) {
-            return createCancelError();
-          }
-          await opts.onChunk?.(chunk, requestId);
-          switch (chunk.type) {
-            case 'text-delta': {
-              const textDelta = chunk.delta;
-              text += textDelta;
-              await opts.onTextDelta?.(textDelta);
-              break;
-            }
-            case 'reasoning-delta':
-              reasoning += chunk.delta;
-              break;
-            case 'reasoning-end':
-              if (chunk.providerMetadata) {
-                reasoningProviderMetadata = chunk.providerMetadata;
-              }
-              break;
-            case 'tool-call':
-              toolCalls.push({
-                toolCallId: chunk.toolCallId,
-                toolName: chunk.toolName,
-                input: chunk.input,
-                ...(chunk.providerMetadata && {
-                  providerMetadata: chunk.providerMetadata,
-                }),
-              });
-              break;
-            case 'finish':
-              lastUsage = Usage.fromEventUsage(chunk.usage);
-              totalUsage.add(lastUsage);
-              if (toolCalls.length === 0 && text.trim() === '') {
-                const error = new Error(
-                  'Empty response: no text or tool calls received',
-                );
-                (error as any).isRetryable = true;
-                throw error;
-              }
-              break;
-            case 'error': {
-              const message = (() => {
-                if ((chunk as any).error.message) {
-                  return (chunk as any).error.message;
-                }
-                try {
-                  const message = JSON.parse(
-                    (chunk as any).error.value?.details,
-                  )?.error?.message;
-                  if (message) {
-                    return message;
-                  }
-                } catch (_e) {}
-                return JSON.stringify(chunk.error);
-              })();
-              const error = new Error(message);
-              (error as any).isRetryable = false;
-              const value = (chunk.error as any).value;
-              if (value) {
-                (error as any).statusCode = value?.status;
-              }
-              throw error;
-            }
-            default:
-              break;
-          }
-        }
-
-        break;
-      } catch (error: any) {
-        const nextRetryCount = retryCount + 1;
-        const retryDelayMs = 1000 * Math.pow(2, nextRetryCount - 1);
-        const retryStartTime = Date.now();
-        opts.onStreamResult?.({
-          requestId,
-          prompt,
-          model: opts.model,
-          tools,
-          response: {
-            statusCode: error.statusCode,
-            headers: error.responseHeaders,
-            body: error.responseBody,
-          },
-          error: {
-            data: error.data || error.message,
-            isRetryable: error.isRetryable,
-            retryAttempt: retryCount,
-            maxRetries: errorRetryTurns,
-            retryDelayMs,
-            retryStartTime,
-          },
+      }
+      for (const toolCall of toolCalls) {
+        const tool = opts.tools.get(toolCall.toolName);
+        // compatible with models that may return an empty value instead of a JSON string for input
+        const input = safeParseJson(toolCall.input);
+        const description = tool?.getDescription?.({
+          params: input,
+          cwd: opts.cwd,
         });
-
-        if (error.isRetryable && retryCount < errorRetryTurns) {
-          retryCount++;
-          try {
-            await exponentialBackoffWithCancellation(retryCount, opts.signal);
-          } catch {
-            return createCancelError();
-          }
-          continue;
-        }
-
-        return {
-          success: false,
-          error: {
-            type: 'api_error',
-            message:
-              error instanceof Error
-                ? error.message
-                : 'Unknown streaming error',
-            details: {
-              code: error.data?.error?.code,
-              status: error.data?.error?.status,
-              url: error.url,
-              error,
-              stack: error.stack,
-              retriesAttempted: retryCount,
-            },
-          },
+        const displayName = tool?.displayName;
+        const toolUse: ToolUsePart = {
+          type: 'tool_use',
+          id: toolCall.toolCallId,
+          name: toolCall.toolName,
+          input: input,
         };
+        if (description) {
+          toolUse.description = description;
+        }
+        if (displayName) {
+          toolUse.displayName = displayName;
+        }
+        if (toolCall.providerMetadata) {
+          // @ts-ignore
+          toolUse.providerMetadata = toolCall.providerMetadata;
+        }
+        assistantContent.push(toolUse);
       }
-    }
-
-    // Exit early if cancellation signal is received
-    if (opts.signal?.aborted) {
-      return createCancelError();
-    }
-
-    await opts.onText?.(text);
-
-    // some model may return multiple \n in the end of the reasoning
-    // e.g. antigravity/gemini-3-pro-high
-    if (reasoning) {
-      reasoning = reasoning.trim();
-    }
-
-    if (reasoning) {
-      await opts.onReasoning?.(reasoning);
-    }
-
-    const endTime = new Date();
-    opts.onTurn?.({
-      usage: lastUsage,
-      startTime,
-      endTime,
-    });
-    const model = `${opts.model.provider.id}/${opts.model.model.id}`;
-    const assistantContent: AssistantContent = [];
-    if (reasoning) {
-      assistantContent.push({
-        type: 'reasoning',
-        text: reasoning,
-        ...(reasoningProviderMetadata && {
-          providerMetadata: reasoningProviderMetadata,
-        }),
-      });
-    }
-    if (text) {
-      finalText = text;
-      assistantContent.push({
-        type: 'text',
-        text: text,
-      });
-    }
-    for (const toolCall of toolCalls) {
-      const tool = opts.tools.get(toolCall.toolName);
-      // compatible with models that may return an empty value instead of a JSON string for input
-      const input = safeParseJson(toolCall.input);
-      const description = tool?.getDescription?.({
-        params: input,
-        cwd: opts.cwd,
-      });
-      const displayName = tool?.displayName;
-      const toolUse: ToolUsePart = {
-        type: 'tool_use',
-        id: toolCall.toolCallId,
-        name: toolCall.toolName,
-        input: input,
-      };
-      if (description) {
-        toolUse.description = description;
-      }
-      if (displayName) {
-        toolUse.displayName = displayName;
-      }
-      if (toolCall.providerMetadata) {
-        // @ts-ignore
-        toolUse.providerMetadata = toolCall.providerMetadata;
-      }
-      assistantContent.push(toolUse);
-    }
-    await history.addMessage(
-      {
-        role: 'assistant',
-        content: assistantContent,
-        text,
-        model,
-        usage: {
-          input_tokens: lastUsage.promptTokens,
-          output_tokens: lastUsage.completionTokens,
+      await history.addMessage(
+        {
+          role: 'assistant',
+          content: assistantContent,
+          text,
+          model,
+          usage: {
+            input_tokens: lastUsage.promptTokens,
+            output_tokens: lastUsage.completionTokens,
+          },
         },
-      },
-      requestId,
-    );
-    if (!toolCalls.length) {
-      break;
-    }
-
-    const toolResults: {
-      toolCallId: string;
-      toolName: string;
-      input: Record<string, any>;
-      result: ToolResult;
-    }[] = [];
-    for (const toolCall of toolCalls) {
-      let toolUse: ToolUse = {
-        name: toolCall.toolName,
-        params: safeParseJson(toolCall.input),
-        callId: toolCall.toolCallId,
-      };
-      if (opts.onToolUse) {
-        toolUse = await opts.onToolUse(toolUse as ToolUse);
-      }
-      let approved = true;
-      let updatedParams: ToolParams | undefined = undefined;
-      let denyReason: string | undefined = undefined;
-
-      if (opts.onToolApprove) {
-        const approvalResult = await opts.onToolApprove(toolUse as ToolUse);
-        if (typeof approvalResult === 'object') {
-          approved = approvalResult.approved;
-          updatedParams = approvalResult.params;
-          denyReason = approvalResult.denyReason;
-        } else {
-          approved = approvalResult;
-        }
+        requestId,
+      );
+      if (!toolCalls.length) {
+        break;
       }
 
-      if (approved) {
-        toolCallsCount++;
-        if (updatedParams) {
-          toolUse.params = { ...toolUse.params, ...updatedParams };
-        }
-        let toolResult = await opts.tools.invoke(
-          toolUse.name,
-          JSON.stringify(toolUse.params),
-          toolUse.callId,
+      const toolResults: {
+        toolCallId: string;
+        toolName: string;
+        input: Record<string, any>;
+        result: ToolResult;
+      }[] = [];
+
+      // Helper function to add denied results for unprocessed tools
+      const addDeniedResultsForRemainingTools = async () => {
+        const processedToolCallIds = new Set(
+          toolResults.map((tr) => tr.toolCallId),
         );
-        if (opts.onToolResult) {
-          toolResult = await opts.onToolResult(toolUse, toolResult, approved);
+        for (const remainingToolCall of toolCalls) {
+          if (!processedToolCallIds.has(remainingToolCall.toolCallId)) {
+            const remainingToolUse: ToolUse = {
+              name: remainingToolCall.toolName,
+              params: safeParseJson(remainingToolCall.input),
+              callId: remainingToolCall.toolCallId,
+            };
+            let remainingToolResult: ToolResult = {
+              llmContent:
+                'Error: Tool execution was skipped due to previous tool denial.',
+              isError: true,
+            };
+            if (opts.onToolResult) {
+              remainingToolResult = await opts.onToolResult(
+                remainingToolUse,
+                remainingToolResult,
+                false,
+              );
+            }
+            toolResults.push({
+              toolCallId: remainingToolCall.toolCallId,
+              toolName: remainingToolCall.toolName,
+              input: safeParseJson(remainingToolCall.input),
+              result: remainingToolResult,
+            });
+          }
         }
-        toolResults.push({
-          toolCallId: toolUse.callId,
-          toolName: toolUse.name,
-          input: toolUse.params,
-          result: toolResult,
-        });
-        // Prevent normal turns from being terminated due to exceeding the limit
-        turnsCount--;
-      } else {
-        let message = 'Error: Tool execution was denied by user.';
-        if (denyReason) {
-          message = `Tool use rejected with user message: ${denyReason}`;
-        }
-        let toolResult: ToolResult = {
-          llmContent: message,
-          isError: true,
-        };
-        if (opts.onToolResult) {
-          toolResult = await opts.onToolResult(toolUse, toolResult, approved);
-        }
-        toolResults.push({
-          toolCallId: toolUse.callId,
-          toolName: toolUse.name,
-          input: toolUse.params,
-          result: toolResult,
-        });
+      };
 
-        if (!denyReason) {
-          await history.addMessage({
-            role: 'tool',
-            content: toolResults.map((tr) =>
-              createToolResultPart2(
-                tr.toolCallId,
-                tr.toolName,
-                tr.input,
-                tr.result,
-              ),
-            ),
-          });
-          return {
-            success: false,
-            error: {
-              type: 'tool_denied',
-              message,
-              details: {
-                toolUse,
-                history,
-                usage: totalUsage,
-              },
-            },
-          };
+      const approvedToolUses: ToolUse[] = [];
+      let earlyReturn: LoopResult | null = null;
+
+      for (const toolCall of toolCalls) {
+        let toolUse: ToolUse = {
+          name: toolCall.toolName,
+          params: safeParseJson(toolCall.input),
+          callId: toolCall.toolCallId,
+        };
+        if (opts.onToolUse) {
+          toolUse = await opts.onToolUse(toolUse as ToolUse);
+        }
+        let approved = true;
+        let updatedParams: ToolParams | undefined = undefined;
+        let denyReason: string | undefined = undefined;
+
+        if (opts.onToolApprove) {
+          const approvalResult = await opts.onToolApprove(toolUse as ToolUse);
+          if (typeof approvalResult === 'object') {
+            approved = approvalResult.approved;
+            updatedParams = approvalResult.params;
+            denyReason = approvalResult.denyReason;
+          } else {
+            approved = approvalResult;
+          }
+        }
+
+        if (approved) {
+          if (updatedParams) {
+            toolUse.params = { ...toolUse.params, ...updatedParams };
+          }
+          approvedToolUses.push(toolUse);
         } else {
-          // When denyReason is provided, we should break out of the tool loop
-          // to let the model react to the rejection before continuing
+          let message = 'Error: Tool execution was denied by user.';
+          if (denyReason) {
+            message = `Tool use rejected with user message: ${denyReason}`;
+          }
+          let toolResult: ToolResult = {
+            llmContent: message,
+            isError: true,
+          };
+          if (opts.onToolResult) {
+            toolResult = await opts.onToolResult(toolUse, toolResult, false);
+          }
+          toolResults.push({
+            toolCallId: toolUse.callId,
+            toolName: toolUse.name,
+            input: toolUse.params,
+            result: toolResult,
+          });
+
+          if (!denyReason) {
+            await addDeniedResultsForRemainingTools();
+            await history.addMessage({
+              role: 'tool',
+              content: toolResults.map((tr) =>
+                createToolResultPart2(
+                  tr.toolCallId,
+                  tr.toolName,
+                  tr.input,
+                  tr.result,
+                ),
+              ),
+            });
+            earlyReturn = {
+              success: false,
+              error: {
+                type: 'tool_denied',
+                message,
+                details: {
+                  toolUse,
+                  history,
+                  usage: totalUsage,
+                },
+              },
+            };
+            break;
+          }
+          await addDeniedResultsForRemainingTools();
           break;
         }
       }
-    }
-    if (toolResults.length) {
-      await history.addMessage({
-        role: 'tool',
-        content: toolResults.map((tr) =>
-          createToolResultPart2(
-            tr.toolCallId,
-            tr.toolName,
-            tr.input,
-            tr.result,
+
+      if (earlyReturn) {
+        return earlyReturn;
+      }
+
+      if (approvedToolUses.length > 0) {
+        const executionResults = await Promise.allSettled(
+          approvedToolUses.map(async (toolUse) => {
+            let toolResult = await opts.tools.invoke(
+              toolUse.name,
+              JSON.stringify(toolUse.params),
+              toolUse.callId,
+            );
+            if (opts.onToolResult) {
+              toolResult = await opts.onToolResult(toolUse, toolResult, true);
+            }
+            return {
+              toolCallId: toolUse.callId,
+              toolName: toolUse.name,
+              input: toolUse.params,
+              result: toolResult,
+            };
+          }),
+        );
+
+        toolCallsCount += approvedToolUses.length;
+        turnsCount -= approvedToolUses.length;
+
+        for (const settledResult of executionResults) {
+          if (settledResult.status === 'fulfilled') {
+            toolResults.push(settledResult.value);
+          } else {
+            const failedIndex = executionResults.indexOf(settledResult);
+            const failedToolUse = approvedToolUses[failedIndex];
+            let errorResult: ToolResult = {
+              llmContent: `Tool execution error: ${settledResult.reason instanceof Error ? settledResult.reason.message : String(settledResult.reason)}`,
+              isError: true,
+            };
+            if (opts.onToolResult) {
+              errorResult = await opts.onToolResult(
+                failedToolUse,
+                errorResult,
+                true,
+              );
+            }
+            toolResults.push({
+              toolCallId: failedToolUse.callId,
+              toolName: failedToolUse.name,
+              input: failedToolUse.params,
+              result: errorResult,
+            });
+          }
+        }
+      }
+
+      // Check for cancellation before adding tool results
+      // session.cancel already handles adding tool results for incomplete tools
+      if (opts.signal?.aborted) {
+        return createCancelError();
+      }
+
+      if (toolResults.length) {
+        await history.addMessage({
+          role: 'tool',
+          content: toolResults.map((tr) =>
+            createToolResultPart2(
+              tr.toolCallId,
+              tr.toolName,
+              tr.input,
+              tr.result,
+            ),
           ),
-        ),
-      });
+        });
+      }
     }
+    const duration = Date.now() - startTime;
+    return {
+      success: true,
+      data: {
+        text: finalText,
+        history,
+        usage: totalUsage,
+      },
+      metadata: {
+        turnsCount,
+        toolCallsCount,
+        duration,
+      },
+    };
+  } finally {
+    cleanup();
   }
-  const duration = Date.now() - startTime;
-  return {
-    success: true,
-    data: {
-      text: finalText,
-      history,
-      usage: totalUsage,
-    },
-    metadata: {
-      turnsCount,
-      toolCallsCount,
-      duration,
-    },
-  };
 }

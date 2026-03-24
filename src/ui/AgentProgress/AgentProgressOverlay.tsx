@@ -12,13 +12,14 @@ import {
   formatDuration,
   formatTokens,
   groupMessages,
+  truncateLine,
 } from './utils';
 
 const VISIBLE_MESSAGE_LIMIT = 3;
 
 const COLORS = {
   RUNNING: 'gray',
-  COMPLETED: 'green',
+  COMPLETED: UI_COLORS.TOOL,
   FAILED: 'red',
   AGENT_TYPE: 'cyan',
   HINT: 'gray',
@@ -98,7 +99,7 @@ export function AgentStarting({ toolUse }: AgentProgressOverlayProps) {
   }, [waitingForApproval]);
 
   return (
-    <Box flexDirection="column" paddingX={1}>
+    <Box flexDirection="column">
       <AgentToolUse toolUse={toolUse} status="running" />
       <Box marginTop={SPACING.MESSAGE_MARGIN_TOP_TOOL_RESULT} paddingLeft={1}>
         <Text color={UI_COLORS.TOOL_RESULT}>
@@ -130,8 +131,11 @@ export function AgentInProgress({
   // Calculate statistics
   const stats = useMemo(() => calculateStats(messages), [messages]);
 
-  // Group messages into LogItems
-  const logItems = useMemo(() => groupMessages(messages), [messages]);
+  // Group messages into LogItems, filter out user messages (prompt shown separately)
+  const logItems = useMemo(
+    () => groupMessages(messages).filter((item) => item.type !== 'user'),
+    [messages],
+  );
 
   // Smart truncation: show only last N items by default
   const visibleItems = transcriptMode
@@ -175,6 +179,14 @@ export function AgentInProgress({
           </Box>
         )}
 
+        {!transcriptMode && prompt && (
+          <Box paddingLeft={1}>
+            <Text color="gray">
+              {'>'} {truncateLine(prompt)}
+            </Text>
+          </Box>
+        )}
+
         {visibleItems.map((item) => (
           <LogItemRenderer key={item.id} item={item} />
         ))}
@@ -188,6 +200,73 @@ export function AgentInProgress({
           {stats.toolCalls} tool uses · {formatTokens(stats.tokens)} tokens
         </Text>
       </Box>
+    </Box>
+  );
+}
+
+interface AgentCompletedFromProgressProps {
+  toolUse: ToolUsePart;
+  progressData: AgentProgressState;
+}
+
+export function AgentCompletedFromProgress({
+  toolUse,
+  progressData,
+}: AgentCompletedFromProgressProps) {
+  const { transcriptMode } = useAppStore();
+  const { messages } = progressData;
+  const isError = progressData.status === 'failed';
+  const stats = useMemo(() => calculateStats(messages), [messages]);
+  const prompt = toolUse.input?.prompt;
+
+  const logItems = useMemo(
+    () => groupMessages(messages).filter((item) => item.type !== 'user'),
+    [messages],
+  );
+
+  return (
+    <Box flexDirection="column">
+      <AgentToolUse
+        toolUse={toolUse}
+        status={isError ? 'failed' : 'completed'}
+        model={progressData.model}
+      />
+
+      <Box marginLeft={2}>
+        <Text color={isError ? COLORS.FAILED : 'gray'}>
+          {isError ? 'Failed' : 'Done'} ({stats.toolCalls} tool uses ·{' '}
+          {formatTokens(stats.tokens)} tokens)
+        </Text>
+      </Box>
+
+      {transcriptMode && (
+        <Box flexDirection="column" marginLeft={2} marginTop={1}>
+          <Box flexDirection="column" marginLeft={2}>
+            {prompt && (
+              <Box flexDirection="column" marginBottom={1}>
+                <Box>
+                  <Text color="gray">↳ </Text>
+                  <Text bold color="cyan">
+                    Prompt:
+                  </Text>
+                </Box>
+                <Text color="gray">{prompt}</Text>
+              </Box>
+            )}
+            {logItems.map((item) => (
+              <LogItemRenderer key={item.id} item={item} />
+            ))}
+          </Box>
+        </Box>
+      )}
+
+      {!transcriptMode && (
+        <Box marginLeft={2}>
+          <Text color="gray" dimColor>
+            Press ctrl+o to expand
+          </Text>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -260,7 +339,7 @@ export function AgentCompletedResult({
   }, [stats, isError, content]);
 
   return (
-    <Box flexDirection="column" marginTop={1}>
+    <Box flexDirection="column">
       <AgentToolUse
         toolUse={toolUse}
         status={isError ? 'failed' : 'completed'}

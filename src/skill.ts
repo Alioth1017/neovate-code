@@ -5,10 +5,27 @@ import path from 'pathe';
 import type { Context } from './context';
 import type { Paths } from './paths';
 import { PluginHookType } from './plugin';
+import type { ScopedSkillPath } from './pluginRegistry/scopedTypes';
 import { safeFrontMatter } from './utils/safeFrontMatter';
+
+/**
+ * Check if a directory entry is a directory or a symlink pointing to a directory.
+ */
+function isDirOrSymlinkToDir(parentDir: string, entry: fs.Dirent): boolean {
+  if (entry.isDirectory()) return true;
+  if (entry.isSymbolicLink()) {
+    try {
+      return fs.statSync(path.join(parentDir, entry.name)).isDirectory();
+    } catch {
+      // broken symlink, skip
+    }
+  }
+  return false;
+}
 
 export enum SkillSource {
   Plugin = 'plugin',
+  Config = 'config',
   GlobalClaude = 'global-claude',
   Global = 'global',
   ProjectClaude = 'project-claude',
@@ -34,9 +51,23 @@ export interface SkillLoadOutcome {
 
 export interface AddSkillOptions {
   global?: boolean;
+  claude?: boolean;
   overwrite?: boolean;
   name?: string;
   targetDir?: string;
+}
+
+export interface SkillPreview {
+  name: string;
+  description: string;
+  skillPath: string;
+  skillDir: string;
+}
+
+export interface PreviewSkillsResult {
+  tempDir: string;
+  skills: SkillPreview[];
+  errors: SkillError[];
 }
 
 export interface AddSkillResult {
@@ -46,7 +77,7 @@ export interface AddSkillResult {
 }
 
 const MAX_NAME_LENGTH = 64;
-const MAX_DESCRIPTION_LENGTH = 1024;
+const MAX_DESCRIPTION_LENGTH = 2048;
 
 export interface SkillManagerOpts {
   context: Context;
@@ -99,11 +130,18 @@ export class SkillManager {
     });
 
     if (Array.isArray(pluginSkills)) {
-      for (const skillPath of pluginSkills) {
-        if (typeof skillPath !== 'string') {
+      for (const item of pluginSkills) {
+        const skillPath =
+          typeof item === 'string' ? item : (item as ScopedSkillPath).path;
+        const pluginName =
+          typeof item === 'string'
+            ? undefined
+            : (item as ScopedSkillPath).pluginName;
+        if (!skillPath || typeof skillPath !== 'string') {
           this.errors.push({
-            path: String(skillPath),
-            message: 'Invalid skill path type: expected string',
+            path: String(item),
+            message:
+              'Invalid skill path type: expected string or ScopedSkillPath',
           });
           continue;
         }
@@ -114,7 +152,29 @@ export class SkillManager {
           });
           continue;
         }
-        this.loadSkillFile(skillPath, SkillSource.Plugin);
+        this.loadSkillFile(skillPath, SkillSource.Plugin, pluginName);
+      }
+    }
+
+    // Load skills from config.skills
+    const configSkills = this.context.config.skills;
+    if (Array.isArray(configSkills)) {
+      for (const skillPath of configSkills) {
+        if (typeof skillPath !== 'string') {
+          this.errors.push({
+            path: String(skillPath),
+            message: 'Invalid skill path type: expected string',
+          });
+          continue;
+        }
+        if (!fs.existsSync(skillPath)) {
+          this.errors.push({
+            path: skillPath,
+            message: 'Skill path not found',
+          });
+          continue;
+        }
+        this.loadSkillPath(skillPath, SkillSource.Config);
       }
     }
 
@@ -151,7 +211,7 @@ export class SkillManager {
       const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
 
       for (const entry of entries) {
-        if (entry.isDirectory()) {
+        if (isDirOrSymlinkToDir(skillsDir, entry)) {
           const skillPath = path.join(skillsDir, entry.name, 'SKILL.md');
           if (fs.existsSync(skillPath)) {
             this.loadSkillFile(skillPath, source);
@@ -170,13 +230,47 @@ export class SkillManager {
     }
   }
 
-  private loadSkillFile(skillPath: string, source: SkillSource): void {
+  private loadSkillFile(
+    skillPath: string,
+    source: SkillSource,
+    pluginName?: string,
+  ): void {
     try {
       const content = fs.readFileSync(skillPath, 'utf-8');
       const parsed = this.parseSkillFile(content, skillPath);
 
       if (parsed) {
-        this.skillsMap.set(parsed.name, { ...parsed, source });
+        const name = pluginName ? `${pluginName}:${parsed.name}` : parsed.name;
+        this.skillsMap.set(name, { ...parsed, name, source });
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unknown error loading skill';
+      this.errors.push({
+        path: skillPath,
+        message,
+      });
+    }
+  }
+
+  /**
+   * Load skill from a path that can be either a SKILL.md file or a directory containing SKILL.md.
+   */
+  private loadSkillPath(skillPath: string, source: SkillSource): void {
+    try {
+      const stat = fs.statSync(skillPath);
+      if (stat.isDirectory()) {
+        const skillFilePath = path.join(skillPath, 'SKILL.md');
+        if (fs.existsSync(skillFilePath)) {
+          this.loadSkillFile(skillFilePath, source);
+        } else {
+          this.errors.push({
+            path: skillPath,
+            message: 'Directory does not contain SKILL.md',
+          });
+        }
+      } else {
+        this.loadSkillFile(skillPath, source);
       }
     } catch (error) {
       const message =
@@ -238,14 +332,6 @@ export class SkillManager {
         return null;
       }
 
-      if (attributes.description.includes('\n')) {
-        this.errors.push({
-          path: skillPath,
-          message: 'Description must be a single line',
-        });
-        return null;
-      }
-
       return {
         name: attributes.name,
         description: attributes.description,
@@ -269,6 +355,7 @@ export class SkillManager {
   ): Promise<AddSkillResult> {
     const {
       global: isGlobal = false,
+      claude: isClaude = false,
       overwrite = false,
       name,
       targetDir,
@@ -304,9 +391,21 @@ export class SkillManager {
 
       const targetBaseDir = targetDir
         ? targetDir
-        : isGlobal
-          ? path.join(this.paths.globalConfigDir, 'skills')
-          : path.join(this.paths.projectConfigDir, 'skills');
+        : isClaude && isGlobal
+          ? path.join(
+              path.dirname(this.paths.globalConfigDir),
+              '.claude',
+              'skills',
+            )
+          : isClaude
+            ? path.join(
+                path.dirname(this.paths.projectConfigDir),
+                '.claude',
+                'skills',
+              )
+            : isGlobal
+              ? path.join(this.paths.globalConfigDir, 'skills')
+              : path.join(this.paths.projectConfigDir, 'skills');
 
       fs.mkdirSync(targetBaseDir, { recursive: true });
 
@@ -348,7 +447,14 @@ export class SkillManager {
           name: parsed.name,
           description: parsed.description,
           path: path.join(targetDir, 'SKILL.md'),
-          source: isGlobal ? SkillSource.Global : SkillSource.Project,
+          source:
+            isClaude && isGlobal
+              ? SkillSource.GlobalClaude
+              : isClaude
+                ? SkillSource.ProjectClaude
+                : isGlobal
+                  ? SkillSource.Global
+                  : SkillSource.Project,
         });
       }
 
@@ -431,7 +537,7 @@ export class SkillManager {
     if (fs.existsSync(skillsDir) && fs.statSync(skillsDir).isDirectory()) {
       const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
       for (const entry of entries) {
-        if (entry.isDirectory()) {
+        if (isDirOrSymlinkToDir(skillsDir, entry)) {
           const skillPath = path.join(skillsDir, entry.name, 'SKILL.md');
           if (fs.existsSync(skillPath)) {
             skills.push(skillPath);
@@ -445,7 +551,7 @@ export class SkillManager {
 
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.isDirectory()) {
+      if (isDirOrSymlinkToDir(dir, entry)) {
         const skillPath = path.join(dir, entry.name, 'SKILL.md');
         if (fs.existsSync(skillPath)) {
           skills.push(skillPath);
@@ -493,10 +599,7 @@ export class SkillManager {
         return null;
       }
 
-      if (
-        attributes.description.length > MAX_DESCRIPTION_LENGTH ||
-        attributes.description.includes('\n')
-      ) {
+      if (attributes.description.length > MAX_DESCRIPTION_LENGTH) {
         return null;
       }
 
@@ -506,6 +609,141 @@ export class SkillManager {
       };
     } catch {
       return null;
+    }
+  }
+
+  async previewSkills(source: string): Promise<PreviewSkillsResult> {
+    const tempDir = path.join(os.tmpdir(), `neovate-skill-${Date.now()}`);
+    const result: PreviewSkillsResult = {
+      tempDir,
+      skills: [],
+      errors: [],
+    };
+
+    const normalizedSource = this.normalizeSource(source);
+    const emitter = degit(normalizedSource, { force: true });
+    await emitter.clone(tempDir);
+
+    const skillPaths = this.scanForSkills(tempDir);
+
+    if (skillPaths.length === 0) {
+      result.errors.push({
+        path: source,
+        message: 'No skills found (no SKILL.md files)',
+      });
+      return result;
+    }
+
+    for (const skillPath of skillPaths) {
+      const content = fs.readFileSync(skillPath, 'utf-8');
+      const parsed = this.parseSkillFileForAdd(content, skillPath);
+
+      if (!parsed) {
+        result.errors.push({
+          path: skillPath,
+          message: 'Invalid skill file',
+        });
+        continue;
+      }
+
+      result.skills.push({
+        name: parsed.name,
+        description: parsed.description,
+        skillPath,
+        skillDir: path.dirname(skillPath),
+      });
+    }
+
+    return result;
+  }
+
+  async installFromPreview(
+    preview: PreviewSkillsResult,
+    selectedSkills: SkillPreview[],
+    source: string,
+    options: AddSkillOptions = {},
+  ): Promise<AddSkillResult> {
+    const {
+      global: isGlobal = false,
+      claude: isClaude = false,
+      overwrite = false,
+      name,
+      targetDir,
+    } = options;
+    const result: AddSkillResult = {
+      installed: [],
+      skipped: [],
+      errors: [],
+    };
+
+    if (name && selectedSkills.length > 1) {
+      throw new Error('Cannot use --name when installing multiple skills');
+    }
+
+    const targetBaseDir = targetDir
+      ? targetDir
+      : isClaude && isGlobal
+        ? path.join(
+            path.dirname(this.paths.globalConfigDir),
+            '.claude',
+            'skills',
+          )
+        : isClaude
+          ? path.join(
+              path.dirname(this.paths.projectConfigDir),
+              '.claude',
+              'skills',
+            )
+          : isGlobal
+            ? path.join(this.paths.globalConfigDir, 'skills')
+            : path.join(this.paths.projectConfigDir, 'skills');
+
+    fs.mkdirSync(targetBaseDir, { recursive: true });
+
+    for (const skill of selectedSkills) {
+      const isRootSkill = skill.skillDir === preview.tempDir;
+      const folderName =
+        name ||
+        (isRootSkill
+          ? this.extractFolderName(source)
+          : path.basename(skill.skillDir));
+      const skillTargetDir = path.join(targetBaseDir, folderName);
+
+      if (fs.existsSync(skillTargetDir)) {
+        if (!overwrite) {
+          result.skipped.push({
+            name: skill.name,
+            reason: 'already exists',
+          });
+          continue;
+        }
+        fs.rmSync(skillTargetDir, { recursive: true });
+      }
+
+      this.copyDirectory(skill.skillDir, skillTargetDir);
+
+      result.installed.push({
+        name: skill.name,
+        description: skill.description,
+        path: path.join(skillTargetDir, 'SKILL.md'),
+        source:
+          isClaude && isGlobal
+            ? SkillSource.GlobalClaude
+            : isClaude
+              ? SkillSource.ProjectClaude
+              : isGlobal
+                ? SkillSource.Global
+                : SkillSource.Project,
+      });
+    }
+
+    await this.loadSkills();
+    return result;
+  }
+
+  cleanupPreview(preview: PreviewSkillsResult): void {
+    if (fs.existsSync(preview.tempDir)) {
+      fs.rmSync(preview.tempDir, { recursive: true });
     }
   }
 

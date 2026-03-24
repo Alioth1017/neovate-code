@@ -5,6 +5,7 @@ import resolve from 'resolve';
 import { AgentManager } from './agent/agentManager';
 import { BackgroundTaskManager } from './backgroundTaskManager';
 import { type Config, ConfigManager } from './config';
+import { GlobalData } from './globalData';
 import { MCPManager } from './mcp';
 import type { MessageBus } from './messageBus';
 import { Paths } from './paths';
@@ -14,7 +15,15 @@ import {
   PluginHookType,
   PluginManager,
 } from './plugin';
+import { truncationPlugin } from './plugins/truncation';
+import { checkpointPlugin } from './plugins/checkpoint';
+import { PluginLoader } from './pluginRegistry/loader';
+import { PluginRegistry } from './pluginRegistry/registry';
 import { SkillManager } from './skill';
+import { FileHistoryManager } from './snapshot/FileHistoryManager';
+import createDebug from 'debug';
+
+const debug = createDebug('neovate:context');
 
 type ContextOpts = {
   cwd: string;
@@ -27,10 +36,13 @@ type ContextOpts = {
   argvConfig: Record<string, any>;
   mcpManager: MCPManager;
   backgroundTaskManager: BackgroundTaskManager;
+  fileHistoryManager: FileHistoryManager;
   skillManager?: SkillManager;
   messageBus?: MessageBus;
   agentManager?: AgentManager;
   plugins: (string | Plugin)[];
+  fetch?: typeof globalThis.fetch;
+  globalData: GlobalData;
 };
 
 export type ContextCreateOpts = {
@@ -41,6 +53,8 @@ export type ContextCreateOpts = {
   argvConfig: Record<string, any>;
   plugins: (string | Plugin)[];
   messageBus?: MessageBus;
+  fetch?: typeof globalThis.fetch;
+  noContextCache?: boolean;
 };
 
 export class Context {
@@ -54,10 +68,13 @@ export class Context {
   argvConfig: Record<string, any>;
   mcpManager: MCPManager;
   backgroundTaskManager: BackgroundTaskManager;
+  fileHistoryManager: FileHistoryManager;
   skillManager?: SkillManager;
   messageBus?: MessageBus;
   agentManager?: AgentManager;
   plugins: (string | Plugin)[];
+  fetch?: typeof globalThis.fetch;
+  globalData: GlobalData;
   constructor(opts: ContextOpts) {
     this.cwd = opts.cwd;
     this.productName = opts.productName;
@@ -69,10 +86,13 @@ export class Context {
     this.#pluginManager = opts.pluginManager;
     this.argvConfig = opts.argvConfig;
     this.backgroundTaskManager = opts.backgroundTaskManager;
+    this.fileHistoryManager = opts.fileHistoryManager;
     this.skillManager = opts.skillManager;
     this.messageBus = opts.messageBus;
     this.agentManager = opts.agentManager;
     this.plugins = opts.plugins;
+    this.fetch = opts.fetch;
+    this.globalData = opts.globalData;
   }
 
   async apply(applyOpts: Omit<PluginApplyOpts, 'pluginContext'>) {
@@ -83,6 +103,7 @@ export class Context {
   }
 
   async destroy() {
+    this.fileHistoryManager.destroy();
     await this.mcpManager.destroy();
     await this.apply({
       hook: 'destroy',
@@ -104,20 +125,66 @@ export class Context {
       opts.argvConfig || {},
     );
     const initialConfig = configManager.config;
-    const buildInPlugins: Plugin[] = [];
+    const buildInPlugins: Plugin[] = [checkpointPlugin, truncationPlugin];
     const globalPlugins = scanPlugins(
       path.join(paths.globalConfigDir, 'plugins'),
     );
     const projectPlugins = scanPlugins(
       path.join(paths.projectConfigDir, 'plugins'),
     );
+    const registryPath = path.join(
+      paths.globalConfigDir,
+      'plugins',
+      'installed_plugins.json',
+    );
+    const pluginRegistry = new PluginRegistry({ registryPath });
+    const pluginLoader = new PluginLoader(productName);
+    const enabledPlugins = initialConfig.enabledPlugins || {};
+    const allInstalled = pluginRegistry.getAll();
+    const registeredPlugins: Plugin[] = [];
+    for (const [key, installed] of Object.entries(allInstalled)) {
+      if (enabledPlugins[key] !== true) continue;
+      try {
+        const plugin = await pluginLoader.loadInstalled(installed);
+        registeredPlugins.push(plugin);
+      } catch (_error) {
+        debug('failed to load plugin', key, _error);
+      }
+    }
+
+    debug('registeredPlugins', registeredPlugins);
+
     const pluginsConfigs: (string | Plugin)[] = [
       ...buildInPlugins,
+      ...registeredPlugins,
       ...globalPlugins,
       ...projectPlugins,
       ...(initialConfig.plugins || []),
       ...(opts.plugins || []),
     ];
+
+    const pluginDirs: string[] =
+      typeof opts.argvConfig.pluginDirs === 'string'
+        ? [opts.argvConfig.pluginDirs]
+        : opts.argvConfig.pluginDirs || [];
+    for (const dir of pluginDirs) {
+      const absDir = path.isAbsolute(dir) ? dir : path.resolve(cwd, dir);
+      try {
+        const plugin = await pluginLoader.loadInstalled({
+          name: path.basename(absDir),
+          source: { type: 'local', path: absDir },
+          scope: 'local',
+          installPath: absDir,
+          installedAt: new Date().toISOString(),
+        });
+        pluginsConfigs.push(plugin);
+      } catch (error) {
+        throw new Error(
+          `Failed to load plugin from directory "${absDir}": ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+
     const plugins = await normalizePlugins(opts.cwd, pluginsConfigs);
     const pluginManager = new PluginManager(plugins);
     const apply = async (hookOpts: any) => {
@@ -142,6 +209,10 @@ export class Context {
     };
     const mcpManager = MCPManager.create(mcpServers);
     const backgroundTaskManager = new BackgroundTaskManager();
+    const fileHistoryManager = new FileHistoryManager({
+      cwd,
+      backupRoot: paths.fileHistoryDir,
+    });
 
     const context = new Context({
       cwd,
@@ -154,8 +225,11 @@ export class Context {
       paths,
       mcpManager,
       backgroundTaskManager,
+      fileHistoryManager,
       messageBus: opts.messageBus,
       plugins: pluginsConfigs,
+      fetch: opts.fetch,
+      globalData: new GlobalData({ globalDataPath: paths.getGlobalDataPath() }),
     });
 
     // Create and attach SkillManager
@@ -163,11 +237,15 @@ export class Context {
     await skillManager.loadSkills();
     context.skillManager = skillManager;
 
+    debug('skillManager errors', skillManager.getErrors());
+
     // Create and attach AgentManager
     const agentManager = new AgentManager({ context });
     // Load agents from files
     await agentManager.loadAgents();
     context.agentManager = agentManager;
+
+    debug('agentManager errors', agentManager.getErrors());
 
     return context;
   }

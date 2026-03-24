@@ -1,6 +1,6 @@
 import TurndownService from 'turndown';
 import { z } from 'zod';
-import type { ModelInfo } from '../model';
+import type { ModelInfo } from '../provider/model';
 import { query } from '../query';
 import { createTool } from '../tool';
 import { safeStringify } from '../utils/safeStringify';
@@ -9,7 +9,10 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5min
 const urlCache = new Map();
 const MAX_CONTENT_LENGTH = 15000; // 15k
 
-export function createFetchTool(opts: { model: ModelInfo }) {
+export function createFetchTool(opts: {
+  model: ModelInfo;
+  fetch?: typeof globalThis.fetch;
+}) {
   return createTool({
     name: 'fetch',
     description: `
@@ -49,7 +52,8 @@ Remembers:
           throw new Error('Invalid URL');
         }
 
-        const response = await fetch(url);
+        const fetchFn = opts.fetch ?? globalThis.fetch;
+        const response = await fetchFn(url);
         if (!response.ok) {
           throw new Error(
             `Failed to fetch ${url}: ${response.status} ${response.statusText}`,
@@ -88,7 +92,8 @@ Provide a concise response based only on the content above. In your response:
         const result = await query({
           userPrompt: input,
           model: opts.model,
-          systemPrompt: '',
+          // why？process.env.NEOVATE_CODE_FETCH_SYSTEM_PROMPT The model used internally by Kuaishou Wanqing requires a system prompt, otherwise it will throw an error.
+          systemPrompt: process.env.NEOVATE_CODE_FETCH_SYSTEM_PROMPT ?? '',
         });
         const llmResult = result.success
           ? result.data.text

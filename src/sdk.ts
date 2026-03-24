@@ -1,3 +1,4 @@
+import type { ProviderConfig } from './config';
 import type {
   NormalizedMessage,
   SDKResultMessage,
@@ -6,6 +7,7 @@ import type {
 } from './message';
 import { DirectTransport, MessageBus } from './messageBus';
 import { NodeBridge } from './nodeBridge';
+import type { HandlerMap } from './nodeBridge.types';
 import type { Plugin } from './plugin';
 import { Session } from './session';
 import { randomUUID } from './utils/randomUUID';
@@ -14,11 +16,60 @@ import { randomUUID } from './utils/randomUUID';
 // Types
 // ============================================================================
 
+export type SDKClientOptions = {
+  cwd?: string;
+  productName?: string;
+  plugins?: Plugin[];
+  providers?: Record<string, ProviderConfig>;
+  skills?: string[];
+};
+
+export interface SDKClient {
+  request<K extends keyof HandlerMap>(
+    method: K,
+    params: HandlerMap[K]['input'],
+  ): Promise<HandlerMap[K]['output']>;
+  getHandlerNames(): string[];
+  close(): void;
+}
+
 export type SDKSessionOptions = {
   model: string;
   cwd?: string;
   productName?: string;
   plugins?: Plugin[];
+  /**
+   * Custom provider configurations to add or override built-in providers.
+   * Allows specifying custom API endpoints and model definitions.
+   *
+   * @example
+   * ```typescript
+   * providers: {
+   *   "my-custom-provider": {
+   *     api: "https://my-api.example.com/v1",
+   *     env: ["MY_API_KEY"],
+   *     models: {
+   *       "my-model": "deepseek-v3.2" // Reference existing model
+   *     }
+   *   }
+   * }
+   * ```
+   */
+  providers?: Record<string, ProviderConfig>;
+  /**
+   * Extra SKILL.md file paths for user-defined skills.
+   * Accepts absolute paths to SKILL.md files or directories containing SKILL.md.
+   *
+   * @example
+   * ```typescript
+   * skills: [
+   *   "/path/to/my-skill/SKILL.md",
+   *   "/path/to/skill-directory"
+   * ]
+   * ```
+   */
+  skills?: string[];
+  outputStyle?: string;
 };
 
 export type SDKUserMessage = {
@@ -27,6 +78,7 @@ export type SDKUserMessage = {
   parentUuid: string | null;
   uuid: string;
   sessionId: string;
+  outputStyle?: string;
 };
 
 export type SDKMessage =
@@ -38,7 +90,8 @@ export interface SDKSession {
   readonly sessionId: string;
   send(message: string | SDKUserMessage): Promise<void>;
   receive(): AsyncGenerator<SDKMessage, void>;
-  close(): void;
+  abort(): Promise<void>;
+  close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
 
@@ -61,6 +114,7 @@ class SDKSessionImpl implements SDKSession {
   private nodeBridge: NodeBridge;
   private cwd: string;
   private model: string;
+  private outputStyle?: string;
   private eventQueue: InternalEvent[] = [];
   private eventResolvers: Array<(value: InternalEvent | null) => void> = [];
   private isClosed = false;
@@ -72,6 +126,7 @@ class SDKSessionImpl implements SDKSession {
     nodeBridge: NodeBridge;
     cwd: string;
     model: string;
+    outputStyle?: string;
     initialParentUuid?: string | null;
   }) {
     this.sessionId = opts.sessionId;
@@ -79,6 +134,7 @@ class SDKSessionImpl implements SDKSession {
     this.nodeBridge = opts.nodeBridge;
     this.cwd = opts.cwd;
     this.model = opts.model;
+    this.outputStyle = opts.outputStyle;
     this.currentParentUuid = opts.initialParentUuid ?? null;
 
     this.setupEventHandlers();
@@ -155,6 +211,9 @@ class SDKSessionImpl implements SDKSession {
         model: this.model,
         parentUuid,
         uuid,
+        outputStyle:
+          (typeof message !== 'string' ? message.outputStyle : undefined) ??
+          this.outputStyle,
       })
       .catch((error) => {
         // Fallback if session.done event not received
@@ -199,8 +258,17 @@ class SDKSessionImpl implements SDKSession {
     }
   }
 
-  close(): void {
+  async abort(): Promise<void> {
     if (this.isClosed) return;
+    await this.messageBus.request('session.cancel', {
+      cwd: this.cwd,
+      sessionId: this.sessionId,
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.isClosed) return;
+    await this.abort();
     this.isClosed = true;
 
     for (const resolver of this.eventResolvers) {
@@ -211,7 +279,7 @@ class SDKSessionImpl implements SDKSession {
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
-    this.close();
+    await this.close();
   }
 }
 
@@ -248,6 +316,10 @@ function createBridgePair(options: SDKSessionOptions): {
       version: '0.0.0',
       argvConfig: {
         model: options.model,
+        // Pass custom providers to be merged with built-in providers
+        provider: options.providers,
+        // Pass custom skills to be loaded
+        skills: options.skills,
       },
       plugins: options.plugins || [],
     },
@@ -259,7 +331,7 @@ function createBridgePair(options: SDKSessionOptions): {
   messageBus.setTransport(sdkTransport);
   nodeBridge.messageBus.setTransport(nodeTransport);
 
-  messageBus.registerHandler('toolApproval', async () => {
+  messageBus.registerHandler('toolApproval', async (_params) => {
     return { approved: true };
   });
 
@@ -285,6 +357,7 @@ export async function createSession(
     nodeBridge,
     cwd,
     model: options.model,
+    outputStyle: options.outputStyle,
   });
 }
 
@@ -329,6 +402,33 @@ export async function resumeSession(
     nodeBridge,
     cwd,
     model: options.model,
+    outputStyle: options.outputStyle,
     initialParentUuid: lastUuid,
   });
+}
+
+// ============================================================================
+// Client (non-session handler access)
+// ============================================================================
+
+export function createClient(options: SDKClientOptions = {}): SDKClient {
+  const { nodeBridge, messageBus } = createBridgePair({
+    ...options,
+    model: '',
+  });
+
+  return {
+    request<K extends keyof HandlerMap>(
+      method: K,
+      params: HandlerMap[K]['input'],
+    ): Promise<HandlerMap[K]['output']> {
+      return messageBus.request(method, params);
+    },
+    getHandlerNames(): string[] {
+      return Array.from(nodeBridge.messageBus.messageHandlers.keys());
+    },
+    close() {
+      messageBus.messageHandlers.clear();
+    },
+  };
 }

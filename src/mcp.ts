@@ -334,11 +334,26 @@ export class MCPManager {
       const { Experimental_StdioMCPTransport } = await import(
         '@ai-sdk/mcp/mcp-stdio'
       );
-
+      // Windows: if command is npx/npm/yarn/pnpm/bun/bunx, use cmd.exe to execute, fix: spawn npx ENOENT error
+      const windowsShellCommands = [
+        'npx',
+        'npm',
+        'yarn',
+        'pnpm',
+        'bun',
+        'bunx',
+      ];
+      let command = config.command;
+      let args = config.args;
+      const isWin = process.platform === 'win32';
+      if (isWin && windowsShellCommands.includes(command.toLowerCase())) {
+        args = ['/c', command, ...(args || [])];
+        command = 'cmd.exe';
+      }
       return experimental_createMCPClient({
         transport: new Experimental_StdioMCPTransport({
-          command: config.command,
-          args: config.args,
+          command,
+          args,
           stderr: 'ignore',
           env,
         }),
@@ -442,13 +457,17 @@ export class MCPManager {
     serverName: string,
     config: MCPConfig,
   ): Tool {
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeToolName = toolName.replace(/[^a-zA-Z0-9_-]/g, '_');
+
     return {
-      name: `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '')}__${toolName}`,
+      name: `mcp__${safeServerName}__${safeToolName}`,
       description: toolDef.description,
       getDescription: ({ params }) => {
         return formatParamsDescription(params as Record<string, any>);
       },
-      parameters: toolDef.inputSchema.jsonSchema,
+      // Why? Some models do not support null values, so null values need to be removed.
+      parameters: removeNullValues(toolDef.inputSchema.jsonSchema),
       execute: async (params) => {
         try {
           // toolDef is already a Tool from AI SDK with an execute method
@@ -515,6 +534,26 @@ export function parseMcpConfig(
   }
 
   return mcpServers;
+}
+
+function removeNullValues(obj: unknown): any {
+  if (obj === null || obj === undefined) {
+    return undefined;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(removeNullValues).filter((v) => v !== undefined);
+  }
+  if (typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      const cleaned = removeNullValues(v);
+      if (cleaned !== undefined) {
+        result[k] = cleaned;
+      }
+    }
+    return result;
+  }
+  return obj;
 }
 
 function formatParamsDescription(params: Record<string, any>): string {

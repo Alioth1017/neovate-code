@@ -1,8 +1,8 @@
 import defu from 'defu';
 import fs from 'fs';
-import { homedir } from 'os';
+import os from 'os';
 import path from 'pathe';
-import type { Provider } from './model';
+import type { Provider } from './provider/model';
 
 export type McpStdioServerConfig = {
   type: 'stdio';
@@ -43,13 +43,6 @@ export type CommitConfig = {
 
 export type ProviderConfig = Partial<Omit<Provider, 'createModel'>>;
 
-export type DesktopConfig = {
-  theme?: 'light' | 'dark' | 'system';
-  sendMessageWith?: 'enter' | 'cmdEnter';
-  terminalFont?: string;
-  terminalFontSize?: number;
-};
-
 export type Config = {
   model: string;
   planModel: string;
@@ -70,13 +63,20 @@ export type Config = {
    * @default true
    */
   autoCompact?: boolean;
+  /**
+   * Controls whether automatic tool output truncation is enabled.
+   * When enabled, large tool outputs (>2000 lines or >50KB) will be truncated
+   * and full content saved to a local file.
+   *
+   * @default true
+   */
+  truncation?: boolean;
   commit?: CommitConfig;
   outputStyle?: string;
   outputFormat?: 'text' | 'stream-json' | 'json';
   autoUpdate?: boolean;
   temperature?: number;
   httpProxy?: string;
-  desktop?: DesktopConfig;
   /**
    * Extensions configuration for third-party custom agents.
    * Allows arbitrary nested configuration without validation.
@@ -92,6 +92,37 @@ export type Config = {
    * Example: { explore: { model: "anthropic/claude-haiku-4" } }
    */
   agent?: Record<string, AgentConfig>;
+  /**
+   * Extra SKILL.md file paths for user-defined skills.
+   * Accepts absolute paths to SKILL.md files or directories containing SKILL.md.
+   * Example: ["/path/to/my-skill/SKILL.md", "/path/to/skill-dir"]
+   */
+  skills?: string[];
+  /**
+   * Notification configuration.
+   * - true: play default sound (Funk/warning)
+   * - false: disabled
+   * - string: custom sound name (e.g., "Glass", "Ping")
+   * - object: extended notification config (reserved for future use, e.g., url)
+   */
+  notification?: boolean | string;
+  /**
+   * Default thinking/reasoning effort level for models that support it.
+   * - 'low', 'medium', 'high', 'max', 'xhigh': Use specified level if supported
+   * - 'maxOrXhigh': Prefer xhigh if available, otherwise max
+   */
+  thinkingLevel?: 'low' | 'medium' | 'high' | 'max' | 'xhigh' | 'maxOrXhigh';
+  /**
+   * Controls whether rewind checkpoints are enabled.
+   * When enabled, snapshots are created after each AI response to allow
+   * rewinding to previous states with code restoration.
+   *
+   * @default true
+   */
+  checkpoints?: boolean;
+  recentModels?: number;
+  enabledPlugins?: Record<string, boolean>;
+  marketplaces?: Array<{ name: string; source: string }>;
 };
 
 const DEFAULT_CONFIG: Partial<Config> = {
@@ -103,15 +134,15 @@ const DEFAULT_CONFIG: Partial<Config> = {
   provider: {},
   todo: true,
   autoCompact: true,
+  truncation: true,
   outputFormat: 'text',
   autoUpdate: true,
   extensions: {},
   tools: {},
   agent: {},
-  desktop: {
-    theme: 'light',
-    sendMessageWith: 'enter',
-  },
+  checkpoints: true,
+  recentModels: 10,
+  marketplaces: [],
 };
 const VALID_CONFIG_KEYS = [
   ...Object.keys(DEFAULT_CONFIG),
@@ -122,6 +153,7 @@ const VALID_CONFIG_KEYS = [
   'systemPrompt',
   'todo',
   'autoCompact',
+  'truncation',
   'commit',
   'outputStyle',
   'autoUpdate',
@@ -131,19 +163,33 @@ const VALID_CONFIG_KEYS = [
   'extensions',
   'tools',
   'agent',
+  'notification',
+  'skills',
+  'thinkingLevel',
+  'checkpoints',
+  'recentModels',
+  'enabledPlugins',
+  'marketplaces',
 ];
-const ARRAY_CONFIG_KEYS = ['plugins'];
+const ARRAY_CONFIG_KEYS = ['plugins', 'skills', 'marketplaces'];
 const OBJECT_CONFIG_KEYS = [
   'mcpServers',
   'commit',
   'provider',
   'extensions',
   'tools',
-  'desktop',
   'agent',
+  'enabledPlugins',
 ];
-const BOOLEAN_CONFIG_KEYS = ['quiet', 'todo', 'autoCompact', 'autoUpdate'];
-export const GLOBAL_ONLY_KEYS = ['desktop'];
+const BOOLEAN_CONFIG_KEYS = [
+  'quiet',
+  'todo',
+  'autoCompact',
+  'autoUpdate',
+  'truncation',
+  'checkpoints',
+];
+export const GLOBAL_ONLY_KEYS: string[] = [];
 
 function assertGlobalAllowed(global: boolean, key: string) {
   const rootKey = key.split('.')[0];
@@ -158,11 +204,14 @@ export class ConfigManager {
   argvConfig: Partial<Config>;
   globalConfigPath: string;
   projectConfigPath: string;
+  projectLocalConfigPath: string;
+  #projectFileConfig: Partial<Config>;
+  #localFileConfig: Partial<Config>;
 
   constructor(cwd: string, productName: string, argvConfig: Partial<Config>) {
     const lowerProductName = productName.toLowerCase();
     const globalConfigPath = path.join(
-      homedir(),
+      os.homedir(),
       `.${lowerProductName}`,
       'config.json',
     );
@@ -178,11 +227,11 @@ export class ConfigManager {
     );
     this.globalConfigPath = globalConfigPath;
     this.projectConfigPath = projectConfigPath;
+    this.projectLocalConfigPath = projectLocalConfigPath;
     this.globalConfig = loadConfig(globalConfigPath);
-    this.projectConfig = defu(
-      loadConfig(projectConfigPath),
-      loadConfig(projectLocalConfigPath),
-    );
+    this.#projectFileConfig = loadConfig(projectConfigPath);
+    this.#localFileConfig = loadConfig(projectLocalConfigPath);
+    this.projectConfig = defu(this.#projectFileConfig, this.#localFileConfig);
     this.argvConfig = argvConfig;
   }
 
@@ -191,6 +240,12 @@ export class ConfigManager {
       this.argvConfig,
       defu(this.projectConfig, defu(this.globalConfig, DEFAULT_CONFIG)),
     ) as Config;
+    config.enabledPlugins = mergeEnabledPlugins(
+      this.globalConfig.enabledPlugins,
+      this.#projectFileConfig.enabledPlugins,
+      this.#localFileConfig.enabledPlugins,
+      this.argvConfig.enabledPlugins,
+    );
     config.planModel = config.planModel || config.model;
     config.smallModel = config.smallModel || config.model;
     config.visionModel = config.visionModel || config.model;
@@ -378,6 +433,48 @@ export class ConfigManager {
     saveConfig(configPath, config, DEFAULT_CONFIG);
   }
 
+  setPluginEnabled(
+    scope: 'global' | 'project' | 'local',
+    pluginId: string,
+    enabled: boolean,
+  ) {
+    const configPath =
+      scope === 'global'
+        ? this.globalConfigPath
+        : scope === 'project'
+          ? this.projectConfigPath
+          : this.projectLocalConfigPath;
+
+    const source =
+      scope === 'global'
+        ? this.globalConfig
+        : scope === 'project'
+          ? this.#projectFileConfig
+          : this.#localFileConfig;
+
+    if (!source.enabledPlugins) {
+      source.enabledPlugins = {};
+    }
+    source.enabledPlugins[pluginId] = enabled;
+    saveConfig(configPath, source, DEFAULT_CONFIG);
+  }
+
+  removePluginEnabled(pluginId: string) {
+    const entries: Array<[Partial<Config>, string]> = [
+      [this.globalConfig, this.globalConfigPath],
+      [this.#projectFileConfig, this.projectConfigPath],
+      [this.#localFileConfig, this.projectLocalConfigPath],
+    ];
+    for (const [source, configPath] of entries) {
+      if (source.enabledPlugins?.[pluginId] !== undefined) {
+        delete source.enabledPlugins[pluginId];
+        if (fs.existsSync(configPath)) {
+          saveConfig(configPath, source, DEFAULT_CONFIG);
+        }
+      }
+    }
+  }
+
   updateConfig(global: boolean, newConfig: Partial<Config>) {
     Object.keys(newConfig).forEach((key) => {
       if (!VALID_CONFIG_KEYS.includes(key)) {
@@ -425,4 +522,19 @@ function saveConfig(
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(file, JSON.stringify(filteredConfig, null, 2), 'utf-8');
+}
+
+function mergeEnabledPlugins(
+  ...layers: (Record<string, boolean> | undefined)[]
+): Record<string, boolean> {
+  const result: Record<string, boolean> = {};
+  for (const layer of layers) {
+    if (!layer) continue;
+    for (const [key, value] of Object.entries(layer)) {
+      if (typeof value === 'boolean') {
+        result[key] = value;
+      }
+    }
+  }
+  return result;
 }

@@ -3,9 +3,10 @@ import type { ReactNode } from 'react';
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import type { ApprovalMode } from '../config';
+import { PLAN_MODE_EVENTS, TOOL_NAMES } from '../constants';
 import type { LoopResult, StreamResult, ThinkingConfig } from '../loop';
 import type { Message, NormalizedMessage, UserMessage } from '../message';
-import type { ModelInfo, ProvidersMap } from '../model';
+import type { ModelInfo, ProvidersMap } from '../provider/model';
 import { Paths } from '../paths';
 import { loadSessionMessages, Session, SessionConfigManager } from '../session';
 import {
@@ -20,6 +21,7 @@ import { setTerminalTitle } from '../utils/setTerminalTitle';
 import { clearTerminal } from '../utils/terminal';
 import { countTokens } from '../utils/tokenCounter';
 import { getUsername } from '../utils/username';
+import { findLastAssistantAfterUser } from '../utils/messageQuery';
 import { detectImageFormat } from './TextInput/utils/imagePaste';
 
 export type ApprovalResult =
@@ -98,7 +100,10 @@ interface AppState {
   bashMode: boolean;
   approvalMode: ApprovalMode;
 
-  planResult: string | null;
+  // Plan Mode state
+  planFilePath: string | null;
+  planContent: string | null;
+
   processingStartTime: number | null;
   processingTokens: number;
   processingToolCalls: number;
@@ -199,16 +204,16 @@ interface AppActions {
   setDraftInput: (draftInput: string) => void;
   setHistoryIndex: (historyIndex: number | null) => void;
   toggleMode: () => void;
-  approvePlan: (planResult: string) => void;
-  denyPlan: () => void;
   resumeSession: (sessionId: string, logFile: string) => Promise<void>;
   setModel: (model: string) => void;
   approveToolUse: ({
     toolUse,
     category,
+    sessionId,
   }: {
     toolUse: ToolUse;
     category?: ApprovalCategory;
+    sessionId: string;
   }) => Promise<{
     approved: boolean;
     params?: Record<string, unknown>;
@@ -243,7 +248,7 @@ interface AppActions {
   setPastedImageMap: (map: Record<string, string>) => Promise<void>;
   showForkModal: () => void;
   hideForkModal: () => void;
-  fork: (targetMessageUuid: string) => Promise<void>;
+  fork: (targetMessageUuid: string, restoreCode?: boolean) => Promise<void>;
   incrementForkCounter: () => void;
   setBashBackgroundPrompt: (prompt: BashPromptBackgroundEvent) => void;
   clearBashBackgroundPrompt: () => void;
@@ -262,6 +267,14 @@ interface AppActions {
   clearAgentProgress: (toolUseId: string) => void;
   toggleTranscriptMode: () => void;
   setWindowFocused: (focused: boolean) => void;
+
+  // Plan Mode actions
+  setPlanContent: (content: string) => void;
+  exitPlanMode: (opts: {
+    approved: boolean;
+    approvalMode?: 'autoEdit';
+    feedback?: string;
+  }) => void;
 }
 
 export type AppStore = AppState & AppActions;
@@ -288,6 +301,10 @@ export const useAppStore = create<AppStore>()(
       brainstormMode: false,
       bashMode: false,
       approvalMode: 'default',
+
+      // Plan Mode initial state
+      planFilePath: null,
+      planContent: null,
       messages: [],
       currentMessage: null,
       queuedMessages: [],
@@ -297,7 +314,6 @@ export const useAppStore = create<AppStore>()(
       sessionId: null,
       logs: [],
       debugMode: false,
-      planResult: null,
       processingStartTime: null,
       processingTokens: 0,
       processingToolCalls: 0,
@@ -347,7 +363,7 @@ export const useAppStore = create<AppStore>()(
           model: response.data.model,
           planModel: response.data.planModel,
           initializeModelError: response.data.initializeModelError,
-          modelContextLimit: response.data.model?.model?.limit.context || 0,
+          modelContextLimit: response.data.model?.model?.limit?.context || 0,
           providers: response.data.providers,
           sessionId: opts.sessionId,
           messages: opts.messages,
@@ -360,8 +376,8 @@ export const useAppStore = create<AppStore>()(
           pastedTextMap: response.data.pastedTextMap || {},
           pastedImageMap: response.data.pastedImageMap || {},
           userName: getUsername() ?? 'user',
-          thinking: response.data.model?.thinkingConfig
-            ? { effort: 'low' }
+          thinking: response.data.thinkingLevel
+            ? { effort: response.data.thinkingLevel as any }
             : undefined,
           // theme: 'light',
         });
@@ -445,6 +461,23 @@ export const useAppStore = create<AppStore>()(
           }
         });
 
+        // Listen for Plan Mode events
+        bridge.onEvent(PLAN_MODE_EVENTS.PREVIEW_PLAN, (data: any) => {
+          // Update preview data before approval modal is shown
+          set({
+            planFilePath: data.planFilePath,
+            planContent: data.planContent,
+          });
+        });
+
+        bridge.onEvent(PLAN_MODE_EVENTS.EXIT_PLAN_MODE, (data: any) => {
+          set({
+            planFilePath: data.planFilePath,
+            planContent: data.planContent,
+          });
+          // Note: Actual exit logic is executed after user approval via exitPlanMode()
+        });
+
         setImmediate(async () => {
           if (opts.initialPrompt) {
             get().send(opts.initialPrompt);
@@ -497,7 +530,26 @@ export const useAppStore = create<AppStore>()(
           brainstormMode,
           status,
           pastedTextMap,
+          initializeModelError,
         } = get();
+
+        if (initializeModelError) {
+          // Allow /model, /login, /logout to bypass the error check
+          // since these commands help users fix their configuration
+          const bypassCommands = ['model', 'login', 'logout'];
+          if (isSlashCommand(message)) {
+            const parsed = parseSlashCommand(message);
+            if (bypassCommands.includes(parsed.command)) {
+              // Allow these commands to proceed
+            } else {
+              get().setInputError(initializeModelError);
+              return;
+            }
+          } else {
+            get().setInputError(initializeModelError);
+            return;
+          }
+        }
 
         if (brainstormMode) {
           message = `/spec:brainstorm ${message}`;
@@ -707,11 +759,6 @@ export const useAppStore = create<AppStore>()(
             message: expandedMessage,
             planMode,
           });
-          if (planMode && result.success) {
-            set({
-              planResult: result.data.text,
-            });
-          }
 
           // Update terminal title after successful send
           if (result.success && get().messages.length <= 2) {
@@ -832,7 +879,10 @@ export const useAppStore = create<AppStore>()(
             forkParentUuid: null,
           });
         } else {
-          if (response.error.type === 'tool_denied') {
+          if (
+            response.error.type === 'tool_denied' ||
+            response.error.type === 'canceled'
+          ) {
             set({
               status: 'idle',
               processingStartTime: null,
@@ -939,31 +989,6 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      approvePlan: (planResult: string) => {
-        set({ planResult: null, planMode: false });
-        const bridge = get().bridge;
-        bridge
-          .request('session.addMessages', {
-            cwd: get().cwd,
-            sessionId: get().sessionId,
-            messages: [
-              {
-                role: 'user',
-                content: [{ type: 'text', text: planResult }],
-              },
-            ],
-          })
-          .catch((error) => {
-            console.error('Failed to add messages:', error);
-          });
-        // Use store's model for plan approval - no need to pass explicitly
-        get().sendMessage({ message: null });
-      },
-
-      denyPlan: () => {
-        set({ planResult: null });
-      },
-
       resumeSession: async (sessionId: string, logFile: string) => {
         await clearTerminal();
         const messages = loadSessionMessages({ logPath: logFile });
@@ -984,7 +1009,6 @@ export const useAppStore = create<AppStore>()(
           draftInput: '',
           logs: [],
           exitMessage: null,
-          planResult: null,
           processingStartTime: null,
           processingTokens: 0,
           processingToolCalls: 0,
@@ -1023,9 +1047,10 @@ export const useAppStore = create<AppStore>()(
           set({
             model: currentModel,
             modelContextLimit: currentModel?.model.limit.context || 0,
-            thinking: currentModel?.thinkingConfig
-              ? { effort: 'low' }
+            thinking: modelsResponse.data.thinkingLevel
+              ? { effort: modelsResponse.data.thinkingLevel as any }
               : undefined,
+            initializeModelError: null,
           });
         }
       },
@@ -1033,9 +1058,11 @@ export const useAppStore = create<AppStore>()(
       approveToolUse: ({
         toolUse,
         category,
+        sessionId: _sessionId,
       }: {
         toolUse: ToolUse;
         category?: ApprovalCategory;
+        sessionId: string;
       }) => {
         const { bridge, cwd, sessionId } = get();
         return new Promise<{
@@ -1053,6 +1080,18 @@ export const useAppStore = create<AppStore>()(
               ) => {
                 set({ approvalModal: null });
                 const isApproved = result !== 'deny';
+
+                // Special handling: ExitPlanMode approval should exit plan mode in UI
+                if (toolUse.name === TOOL_NAMES.EXIT_PLAN_MODE) {
+                  get().exitPlanMode({
+                    approved: isApproved,
+                    approvalMode:
+                      (params?.approvalMode as 'autoEdit' | undefined) ||
+                      undefined,
+                    feedback:
+                      (params?.denyReason as string | undefined) || undefined,
+                  });
+                }
 
                 // Handle denial reason if it exists
                 if (result === 'deny' && params?.denyReason) {
@@ -1139,22 +1178,49 @@ export const useAppStore = create<AppStore>()(
         set({ forkModalVisible: false });
       },
 
-      fork: async (targetMessageUuid: string) => {
+      fork: async (targetMessageUuid: string, restoreCode?: boolean) => {
         const { bridge, cwd, sessionId, messages } = get();
 
-        // Find the target message
-        const targetMessage = messages.find(
+        // Find the target message index (single lookup, reused later)
+        const messageIndex = messages.findIndex(
           (m) => (m as NormalizedMessage).uuid === targetMessageUuid,
         );
-        if (!targetMessage) {
+
+        if (messageIndex === -1) {
           get().log(`Fork error: Message ${targetMessageUuid} not found`);
           return;
         }
 
-        // Filter messages up to and including the target
-        const messageIndex = messages.findIndex(
-          (m) => (m as NormalizedMessage).uuid === targetMessageUuid,
-        );
+        const targetMessage = messages[messageIndex];
+
+        // Restore code to checkpoint if requested
+        if (restoreCode && sessionId) {
+          const targetAssistantUuid = findLastAssistantAfterUser(
+            messages,
+            targetMessageUuid,
+          );
+
+          if (targetAssistantUuid) {
+            const hasSnapshotResult = await bridge.request('snapshot.has', {
+              cwd,
+              sessionId,
+              messageId: targetAssistantUuid,
+            });
+
+            if (
+              hasSnapshotResult.success &&
+              hasSnapshotResult.data?.hasSnapshot
+            ) {
+              await bridge.request('snapshot.rewind', {
+                cwd,
+                sessionId,
+                messageId: targetAssistantUuid,
+              });
+            }
+          }
+        }
+
+        // Filter messages up to (but not including) the target
         const filteredMessages = messages.slice(0, messageIndex);
 
         // Extract content from target message
@@ -1263,16 +1329,19 @@ export const useAppStore = create<AppStore>()(
       toggleThinking: () => {
         const { thinking: current, model } = get();
         if (!model) return;
-        if (!model.thinkingConfig) return;
+        const variants = model.model.variants;
+        if (!variants || Object.keys(variants).length === 0) return;
+        const efforts = Object.keys(variants);
         let next: ThinkingConfig | undefined;
         if (!current) {
-          next = { effort: 'low' };
-        } else if (current.effort === 'low') {
-          next = { effort: 'medium' };
-        } else if (current.effort === 'medium') {
-          next = { effort: 'high' };
+          next = { effort: efforts[0] as any };
         } else {
-          next = undefined;
+          const currentIndex = efforts.indexOf(current.effort);
+          if (currentIndex === -1 || currentIndex >= efforts.length - 1) {
+            next = undefined;
+          } else {
+            next = { effort: efforts[currentIndex + 1] as any };
+          }
         }
         set({ thinking: next });
       },
@@ -1321,6 +1390,31 @@ export const useAppStore = create<AppStore>()(
 
       setWindowFocused: (focused: boolean) => {
         set({ isWindowFocused: focused });
+      },
+
+      // Plan Mode actions
+      setPlanContent: (content: string) => {
+        set({ planContent: content });
+      },
+
+      exitPlanMode: (opts) => {
+        if (opts.approved) {
+          set({
+            planMode: false,
+            planFilePath: null,
+            planContent: null,
+            // Note: Actual value is 'autoEdit' not 'auto-edit'
+            approvalMode:
+              opts.approvalMode === 'autoEdit'
+                ? 'autoEdit'
+                : get().approvalMode,
+          });
+        } else {
+          // On rejection, stay in Plan Mode and clear pending content
+          set({
+            planContent: null,
+          });
+        }
       },
     }),
     { name: 'app-store' },
